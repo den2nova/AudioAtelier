@@ -1,6 +1,8 @@
-# Audio Atelier v1.1
+# Audio Atelier v1.2
 
 動画から必要な音声を切り出し、複数の音声をタイムライン上で並べたり重ねたりできるWindows用デスクトップアプリです。
+
+作った人：電々（[@den2_nova](https://x.com/den2_nova)）
 
 ![Audio Atelier icon](assets/audio_atelier_icon.png)
 
@@ -14,13 +16,17 @@
 - 再生位置を示すプレイヘッド
 - 切り出し範囲と合成クリップ両端への約10msの自動フェード
 - 合成時のピーク超過を抑えるリミッター
+- GUIとCLIで共通利用できるJSONプロジェクト
+- `probe`・`trim`・`mix`を画面なしで実行できるCLI
+- クリップごとのトリム、音量、フェード、ループ、ミュート
+- 任意のLUFSノーマライズとTrue Peak上限設定
 - インストール不要の単一EXEビルド
 
 ## ダウンロード
 
 ソースコードは、このページの「Code」からZIP形式でダウンロードできます。
 
-すぐに使えるビルド済みWindows版は、右側の[Releases](../../releases)から`AudioAtelier-v1.1-Windows.zip`をダウンロードしてください。配布ZIPには`AudioAtelier.exe`と詳しい`README.txt`が入っています。
+すぐに使えるビルド済みWindows版は、右側の[Releases](../../releases)から`AudioAtelier-v1.2-Windows.zip`をダウンロードしてください。配布ZIPには`AudioAtelier.exe`と詳しい`README.txt`が入っています。
 
 ## 必要環境
 
@@ -53,6 +59,23 @@ python app.py
 
 GUIはPython標準のTkinterを使用しています。音声処理は外部のFFmpegコマンドを呼び出します。
 
+## CodexやPowerShellからCLIで使う
+
+引数を付けずに起動するとGUIが開きます。サブコマンドを指定した場合はGUIを開かず、処理完了まで待って終了コードと結果を返します。
+
+```powershell
+AudioAtelier.exe probe --input input.mp4 --json
+
+AudioAtelier.exe trim `
+  --input input.mp4 --start 12.5 --end 18.2 `
+  --output voice.wav --json
+
+AudioAtelier.exe mix `
+  --project project.json --output final_mix.wav --json
+```
+
+`--dry-run`ではFFmpegコマンドと`filter_complex`を処理前に確認できます。既存ファイルを上書きする場合は`--overwrite`を明示します。JSONプロジェクトのフィールドと実行例は[README.txt](README.txt)を参照してください。
+
 ## 単一EXEをビルドする
 
 PowerShellで次を実行します。
@@ -73,6 +96,6 @@ PowerShellで次を実行します。
 
 ## 注意事項
 
-本ソフトは個人制作の無料ツールです。大切な動画・音声ファイルは、あらかじめバックアップを取ってからご利用ください。
+本ソフトは個人制作の無料ツールです。大切なファイルは、あらかじめバックアップを取ってからご利用ください。
 
 FFmpegは本リポジトリおよび配布ZIPには含まれていません。FFmpegの利用条件は、入手元の案内をご確認ください。
