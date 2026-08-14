@@ -22,7 +22,7 @@ from audio_engine import AudioClip
 
 
 APP_NAME = "Audio Atelier"
-APP_VERSION = "v1.2"
+APP_VERSION = "v1.2.1"
 AUTO_FADE_SECONDS = audio.AUTO_FADE_SECONDS
 MIX_LIMITER_CEILING = audio.MIX_LIMITER_CEILING
 BG = "#17191f"
@@ -1064,7 +1064,10 @@ def _hide_own_console_when_launched_from_explorer() -> None:
     try:
         process_ids = (ctypes.c_uint32 * 8)()
         count = ctypes.windll.kernel32.GetConsoleProcessList(process_ids, len(process_ids))
-        if count <= 1:
+        # PyInstallerのonefile版は、通常起動でも親と子の2プロセスが
+        # 同じコンソールへ接続する。シェルから起動した場合はPowerShellや
+        # cmdも加わって3以上になるため、2以下のときだけ自前の画面を隠す。
+        if count <= 2:
             window = ctypes.windll.kernel32.GetConsoleWindow()
             if window:
                 ctypes.windll.user32.ShowWindow(window, 0)
