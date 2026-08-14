@@ -1,4 +1,4 @@
-# Audio Atelier v1.0
+# Audio Atelier v1.1
 
 動画から必要な音声を切り出し、複数の音声をタイムライン上で並べたり重ねたりできるWindows用デスクトップアプリです。
 
@@ -12,13 +12,15 @@
 - タイムライン上での開始位置・レーン変更
 - WAV・MP3・M4A形式での書き出し
 - 再生位置を示すプレイヘッド
+- 切り出し範囲と合成クリップ両端への約10msの自動フェード
+- 合成時のピーク超過を抑えるリミッター
 - インストール不要の単一EXEビルド
 
 ## ダウンロード
 
 ソースコードは、このページの「Code」からZIP形式でダウンロードできます。
 
-すぐに使えるビルド済みWindows版は、右側の[Releases](../../releases)から`AudioAtelier.zip`をダウンロードしてください。配布ZIPには`AudioAtelier.exe`と詳しい`README.txt`が入っています。
+すぐに使えるビルド済みWindows版は、右側の[Releases](../../releases)から`AudioAtelier-v1.1-Windows.zip`をダウンロードしてください。配布ZIPには`AudioAtelier.exe`と詳しい`README.txt`が入っています。
 
 ## 必要環境
 
@@ -59,7 +61,7 @@ PowerShellで次を実行します。
 .\build.ps1
 ```
 
-スクリプトがPyInstallerをインストールし、`dist\AudioAtelier.exe`を生成します。FFmpeg本体はEXEへ同梱しません。
+スクリプトがPyInstallerをインストールし、`version_info.txt`のバージョン情報を組み込んだ`dist\AudioAtelier.exe`を生成します。FFmpeg本体はEXEへ同梱しません。
 
 ## 主な対応形式
 
@@ -74,4 +76,3 @@ PowerShellで次を実行します。
 本ソフトは個人制作の無料ツールです。大切な動画・音声ファイルは、あらかじめバックアップを取ってからご利用ください。
 
 FFmpegは本リポジトリおよび配布ZIPには含まれていません。FFmpegの利用条件は、入手元の案内をご確認ください。
-

@@ -10,6 +10,7 @@ python -m PyInstaller `
     --onefile `
     --name AudioAtelier `
     --icon (Join-Path $ProjectDir "assets\audio_atelier.ico") `
+    --version-file (Join-Path $ProjectDir "version_info.txt") `
     --add-data "$(Join-Path $ProjectDir 'assets\audio_atelier.ico');assets" `
     (Join-Path $ProjectDir "app.py")
 

@@ -19,7 +19,9 @@ from tkinter import filedialog, messagebox, ttk
 
 
 APP_NAME = "Audio Atelier"
-APP_VERSION = "v1.0"
+APP_VERSION = "v1.1"
+AUTO_FADE_SECONDS = 0.010
+MIX_LIMITER_CEILING = 0.95
 BG = "#17191f"
 PANEL = "#22252d"
 PANEL_2 = "#2b2f39"
@@ -131,6 +133,17 @@ def audio_args_for(path: str) -> list[str]:
     if ext == ".m4a":
         return ["-c:a", "aac", "-b:a", "256k"]
     raise ValueError("対応していない出力形式です。")
+
+
+def boundary_fade_filter(duration: float) -> str:
+    """クリップ端のクリックノイズを抑える短い自動フェードを返す。"""
+    duration = max(0.0, float(duration))
+    fade = min(AUTO_FADE_SECONDS, duration / 2.0)
+    fade_out_start = max(0.0, duration - fade)
+    return (
+        f"afade=t=in:st=0:d={fade:.6f}:curve=tri,"
+        f"afade=t=out:st={fade_out_start:.6f}:d={fade:.6f}:curve=tri"
+    )
 
 
 def run_ffmpeg(args: list[str]) -> None:
@@ -392,7 +405,12 @@ class TrimTab(ttk.Frame):
         self.status.set("音声を書き出しています…")
 
         def work():
-            run_ffmpeg(["-ss", f"{start:.6f}", "-i", self.path, "-t", f"{end-start:.6f}", "-map", "0:a:0", "-vn", *audio_args_for(out), out])
+            duration = end - start
+            run_ffmpeg([
+                "-ss", f"{start:.6f}", "-i", self.path, "-t", f"{duration:.6f}",
+                "-map", "0:a:0", "-vn", "-af", boundary_fade_filter(duration),
+                *audio_args_for(out), out,
+            ])
             return out
 
         self.app.jobs.submit(work, lambda p: self._exported(p), lambda e: self._export_failed(e))
@@ -707,9 +725,16 @@ class MixTab(ttk.Frame):
             inputs += ["-i", clip.path]
             delay = max(0, round(clip.start * 1000))
             label = f"a{i}"
-            filters.append(f"[{i}:a]atrim=0:{clip.duration:.6f},asetpts=PTS-STARTPTS,adelay={delay}:all=1[{label}]")
+            filters.append(
+                f"[{i}:a]atrim=0:{clip.duration:.6f},asetpts=PTS-STARTPTS,"
+                f"{boundary_fade_filter(clip.duration)},adelay={delay}:all=1[{label}]"
+            )
             labels.append(f"[{label}]")
-        filters.append(f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:dropout_transition=0:normalize=0,alimiter=limit=0.95[outa]")
+        filters.append(
+            f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:"
+            f"dropout_transition=0:normalize=0,alimiter=limit={MIX_LIMITER_CEILING}:"
+            "level=0:latency=1[outa]"
+        )
         run_ffmpeg([*inputs, "-filter_complex", ";".join(filters), "-map", "[outa]", *audio_args_for(out), out])
 
     def preview(self) -> None:
