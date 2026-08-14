@@ -1,27 +1,30 @@
 from __future__ import annotations
 
+import argparse
 import array
+import ctypes
 import json
 import math
 import os
 import queue
-import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import uuid
-from dataclasses import dataclass
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+import audio_engine as audio
+from audio_engine import AudioClip
+
 
 APP_NAME = "Audio Atelier"
-APP_VERSION = "v1.1"
-AUTO_FADE_SECONDS = 0.010
-MIX_LIMITER_CEILING = 0.95
+APP_VERSION = "v1.2"
+AUTO_FADE_SECONDS = audio.AUTO_FADE_SECONDS
+MIX_LIMITER_CEILING = audio.MIX_LIMITER_CEILING
 BG = "#17191f"
 PANEL = "#22252d"
 PANEL_2 = "#2b2f39"
@@ -34,16 +37,17 @@ CLIP_COLORS = ["#3778c2", "#9472c9", "#c0628c", "#458f79", "#b27843", "#6676c8"]
 
 
 def base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
+    return audio.BASE_DIR
 
 
 BASE_DIR = base_dir()
 DATA_DIR = BASE_DIR / "app_data"
 TEMP_DIR = DATA_DIR / "temp"
-DATA_DIR.mkdir(exist_ok=True)
-TEMP_DIR.mkdir(exist_ok=True)
+
+
+def ensure_data_dirs() -> None:
+    DATA_DIR.mkdir(exist_ok=True)
+    TEMP_DIR.mkdir(exist_ok=True)
 
 
 def resource_path(relative: str) -> Path:
@@ -52,22 +56,11 @@ def resource_path(relative: str) -> Path:
 
 
 def find_tool(name: str) -> str | None:
-    """実行中のEXEを基準に指定順でFFmpeg関連コマンドを探す。"""
-    exe_name = f"{name}.exe" if os.name == "nt" else name
-    candidates = (
-        BASE_DIR / exe_name,
-        BASE_DIR / "bin" / exe_name,
-        BASE_DIR / "ffmpeg" / exe_name,
-        BASE_DIR / "ffmpeg" / "bin" / exe_name,
-    )
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
-    return shutil.which(name)
+    return audio.find_tool(name)
 
 
 def tool_path(name: str) -> str:
-    return find_tool(name) or name
+    return audio.tool_path(name)
 
 
 FFMPEG = tool_path("ffmpeg")
@@ -76,22 +69,11 @@ FFPLAY = tool_path("ffplay")
 
 
 def creation_flags() -> int:
-    return subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    return audio.creation_flags()
 
 
 def probe_duration(path: str) -> float:
-    proc = subprocess.run(
-        [FFPROBE, "-v", "error", "-show_entries", "format=duration", "-of", "json", path],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=creation_flags(),
-    )
-    if proc.returncode != 0:
-        raise RuntimeError(proc.stderr.strip() or "再生時間を取得できませんでした。")
-    data = json.loads(proc.stdout)
-    return max(0.0, float(data["format"]["duration"]))
+    return audio.probe_duration(path)
 
 
 def waveform_points(path: str, count: int = 1400) -> list[float]:
@@ -125,39 +107,15 @@ def format_time(seconds: float) -> str:
 
 
 def audio_args_for(path: str) -> list[str]:
-    ext = Path(path).suffix.lower()
-    if ext == ".wav":
-        return ["-c:a", "pcm_s16le"]
-    if ext == ".mp3":
-        return ["-c:a", "libmp3lame", "-q:a", "2"]
-    if ext == ".m4a":
-        return ["-c:a", "aac", "-b:a", "256k"]
-    raise ValueError("対応していない出力形式です。")
+    return audio.audio_args_for(path)
 
 
 def boundary_fade_filter(duration: float) -> str:
-    """クリップ端のクリックノイズを抑える短い自動フェードを返す。"""
-    duration = max(0.0, float(duration))
-    fade = min(AUTO_FADE_SECONDS, duration / 2.0)
-    fade_out_start = max(0.0, duration - fade)
-    return (
-        f"afade=t=in:st=0:d={fade:.6f}:curve=tri,"
-        f"afade=t=out:st={fade_out_start:.6f}:d={fade:.6f}:curve=tri"
-    )
+    return audio.boundary_fade_filter(duration)
 
 
 def run_ffmpeg(args: list[str]) -> None:
-    proc = subprocess.run(
-        [FFMPEG, "-hide_banner", "-y", *args],
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        creationflags=creation_flags(),
-    )
-    if proc.returncode != 0:
-        lines = [line for line in proc.stderr.splitlines() if line.strip()]
-        raise RuntimeError(lines[-1] if lines else "FFmpegの処理に失敗しました。")
+    audio.run_ffmpeg(args)
 
 
 class BackgroundJobs:
@@ -424,17 +382,6 @@ class TrimTab(ttk.Frame):
         messagebox.showerror(APP_NAME, str(exc))
 
 
-@dataclass
-class AudioClip:
-    id: str
-    path: str
-    name: str
-    start: float
-    duration: float
-    lane: int
-    color: str
-
-
 class TimelineCanvas(tk.Canvas):
     TOP = 34
     LANE_H = 66
@@ -521,7 +468,14 @@ class TimelineCanvas(tk.Canvas):
             y2 = y1 + self.LANE_H - 14
             outline = "#ffffff" if clip.id == self.selected else clip.color
             self.create_rectangle(x1, y1, x2, y2, fill=clip.color, outline=outline, width=2, tags=("clip", clip.id))
-            label = f"{clip.name}  {clip.duration:.2f}s"
+            flags = ""
+            if clip.loop:
+                flags += "  ↻ループ"
+            if clip.mute:
+                flags += "  ミュート"
+            if clip.gain_db:
+                flags += f"  {clip.gain_db:+.1f}dB"
+            label = f"{clip.name}  {clip.duration:.2f}s{flags}"
             self.create_text(x1 + 8, (y1 + y2) / 2, anchor="w", text=label, fill="white", tags=("clip", clip.id))
         self._draw_playhead()
 
@@ -571,6 +525,12 @@ class MixTab(ttk.Frame):
         self.zoom_var = tk.DoubleVar(value=30)
         self.format_var = tk.StringVar(value="wav")
         self.status = tk.StringVar(value="音声ファイルを追加してください")
+        self.project_path: str | None = None
+        self.project_duration: float | None = None
+        self.sample_rate = 48000
+        self.channels = 2
+        self.loudness_lufs: float | None = None
+        self.true_peak_db = -1.0
         self._build()
 
     def _build(self) -> None:
@@ -579,6 +539,8 @@ class MixTab(ttk.Frame):
         ttk.Button(toolbar, text="＋ 音声を追加", command=self.add_files, style="Accent.TButton").pack(side="left")
         ttk.Button(toolbar, text="選択を削除", command=self.delete_selected).pack(side="left", padx=8)
         ttk.Button(toolbar, text="すべて消去", command=self.clear_all).pack(side="left")
+        ttk.Button(toolbar, text="JSONを開く", command=self.open_project).pack(side="left", padx=(16, 8))
+        ttk.Button(toolbar, text="JSON保存", command=self.save_project).pack(side="left")
         ttk.Label(toolbar, text="ズーム").pack(side="right", padx=(14, 5))
         ttk.Scale(toolbar, from_=5, to=100, variable=self.zoom_var, command=lambda v: self.timeline.set_zoom(float(v)), length=160).pack(side="right")
 
@@ -613,6 +575,7 @@ class MixTab(ttk.Frame):
         ttk.Label(selected, text="レーン").pack(side="left", padx=(8, 0))
         ttk.Entry(selected, textvariable=self.lane_var, width=5).pack(side="left", padx=6)
         ttk.Button(selected, text="反映", command=self.apply_selected_values).pack(side="left")
+        ttk.Button(selected, text="詳細設定", command=self.open_clip_details).pack(side="left", padx=(8, 0))
 
         actions = ttk.Frame(self)
         actions.pack(fill="x", pady=(12, 0))
@@ -636,6 +599,51 @@ class MixTab(ttk.Frame):
             return [(p, probe_duration(p)) for p in paths]
 
         self.app.jobs.submit(load, self._files_loaded, lambda e: self._load_failed(e))
+
+    def open_project(self) -> None:
+        path = filedialog.askopenfilename(title="JSONプロジェクトを開く", filetypes=[("Audio Atelier JSON", "*.json"), ("すべて", "*.*")])
+        if not path:
+            return
+        self.status.set("JSONプロジェクトを読み込んでいます…")
+        self.app.jobs.submit(lambda: audio.load_project(path), self._project_loaded, lambda e: self._load_failed(e))
+
+    def _project_loaded(self, project: audio.AudioProject) -> None:
+        for index, clip in enumerate(project.clips):
+            if not clip.color:
+                clip.color = CLIP_COLORS[index % len(CLIP_COLORS)]
+        self.clips[:] = project.clips
+        self.project_path = project.project_path
+        self.project_duration = project.duration
+        self.sample_rate = project.sample_rate
+        self.channels = project.channels
+        self.loudness_lufs = project.loudness_lufs
+        self.true_peak_db = project.true_peak_db
+        self.selected = None
+        self.selected_label.configure(text="未選択")
+        self.timeline.set_clips(self.clips)
+        self.status.set(f"JSONを開きました　{len(self.clips)} 個のクリップ　全体 {format_time(self.total_duration())}")
+
+    def save_project(self) -> None:
+        if not self.clips:
+            messagebox.showinfo(APP_NAME, "先に音声ファイルを追加してください。")
+            return
+        path = filedialog.asksaveasfilename(
+            title="JSONプロジェクトを保存",
+            defaultextension=".json",
+            initialfile=Path(self.project_path).name if self.project_path else "audio_project.json",
+            filetypes=[("Audio Atelier JSON", "*.json")],
+        )
+        if not path:
+            return
+        try:
+            self.project_path = audio.save_project(
+                path, self.clips, self.sample_rate, self.channels, self.total_duration(),
+                self.loudness_lufs, self.true_peak_db,
+            )
+        except Exception as exc:
+            messagebox.showerror(APP_NAME, f"JSONを保存できませんでした。\n{exc}")
+            return
+        self.status.set(f"JSONを保存しました: {self.project_path}")
 
     def _files_loaded(self, items) -> None:
         cursor = max([c.start + c.duration for c in self.clips] + [0.0])
@@ -678,6 +686,72 @@ class MixTab(ttk.Frame):
         self.select_clip(self.selected)
         self.timeline.redraw()
 
+    def open_clip_details(self) -> None:
+        if not self.selected:
+            messagebox.showinfo(APP_NAME, "先にクリップを選択してください。")
+            return
+        clip = self.selected
+        dialog = tk.Toplevel(self)
+        dialog.title(f"クリップ詳細 - {clip.name}")
+        dialog.transient(self.winfo_toplevel())
+        dialog.resizable(False, False)
+        frame = ttk.Frame(dialog, padding=16)
+        frame.pack(fill="both", expand=True)
+        values = {
+            "trim_in": tk.StringVar(value=f"{clip.trim_in:.3f}"),
+            "trim_out": tk.StringVar(value=f"{(clip.trim_out if clip.trim_out is not None else clip.trim_in + clip.duration):.3f}"),
+            "gain_db": tk.StringVar(value=f"{clip.gain_db:.2f}"),
+            "fade_in": tk.StringVar(value=f"{clip.fade_in:.3f}"),
+            "fade_out": tk.StringVar(value=f"{clip.fade_out:.3f}"),
+        }
+        labels = (
+            ("音声内の開始位置（秒）", "trim_in"),
+            ("音声内の終了位置（秒）", "trim_out"),
+            ("音量（dB）", "gain_db"),
+            ("フェードイン（秒）", "fade_in"),
+            ("フェードアウト（秒）", "fade_out"),
+        )
+        for row, (label, key) in enumerate(labels):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=4)
+            ttk.Entry(frame, textvariable=values[key], width=14).grid(row=row, column=1, padx=(14, 0), pady=4)
+        loop_var = tk.BooleanVar(value=clip.loop)
+        mute_var = tk.BooleanVar(value=clip.mute)
+        ttk.Checkbutton(frame, text="プロジェクトの終端までループ", variable=loop_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 2))
+        ttk.Checkbutton(frame, text="ミュート", variable=mute_var).grid(row=6, column=0, columnspan=2, sticky="w", pady=2)
+
+        def apply_details() -> None:
+            try:
+                trim_in = float(values["trim_in"].get())
+                trim_out = float(values["trim_out"].get())
+                gain_db = float(values["gain_db"].get())
+                fade_in = float(values["fade_in"].get())
+                fade_out = float(values["fade_out"].get())
+                source_duration = probe_duration(clip.path)
+                if trim_in < 0 or trim_out <= trim_in or trim_out > source_duration + 0.05:
+                    raise ValueError("開始・終了位置は音声の長さ以内で、終了を開始より後にしてください。")
+                if not all(math.isfinite(v) for v in (gain_db, fade_in, fade_out)) or fade_in < 0 or fade_out < 0:
+                    raise ValueError("音量は有限な数値、フェードは0以上で入力してください。")
+            except ValueError as exc:
+                messagebox.showwarning(APP_NAME, str(exc), parent=dialog)
+                return
+            clip.trim_in = trim_in
+            clip.trim_out = trim_out
+            clip.duration = trim_out - trim_in
+            clip.gain_db = gain_db
+            clip.fade_in = fade_in
+            clip.fade_out = fade_out
+            clip.loop = loop_var.get()
+            clip.mute = mute_var.get()
+            self.timeline.redraw()
+            self.status.set(f"クリップ設定を更新しました　全体 {format_time(self.total_duration())}")
+            dialog.destroy()
+
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=7, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        ttk.Button(buttons, text="キャンセル", command=dialog.destroy).pack(side="left")
+        ttk.Button(buttons, text="反映", command=apply_details, style="Accent.TButton").pack(side="left", padx=(8, 0))
+        dialog.grab_set()
+
     def delete_selected(self) -> None:
         if not self.selected:
             return
@@ -690,6 +764,8 @@ class MixTab(ttk.Frame):
         if self.clips and messagebox.askyesno(APP_NAME, "タイムライン上のクリップをすべて消去しますか？"):
             self.clips.clear()
             self.selected = None
+            self.project_path = None
+            self.project_duration = None
             self.timeline.set_clips(self.clips)
             self.status.set("音声ファイルを追加してください")
 
@@ -715,27 +791,15 @@ class MixTab(ttk.Frame):
         self.status.set(f"先頭を揃えて配置しました　全体 {format_time(self.total_duration())}")
 
     def total_duration(self) -> float:
-        return max([c.start + c.duration for c in self.clips] + [0.0])
+        return max([c.start + c.duration for c in self.clips] + [self.project_duration or 0.0])
 
     def _render_mix(self, out: str) -> None:
-        inputs: list[str] = []
-        filters: list[str] = []
-        labels: list[str] = []
-        for i, clip in enumerate(self.clips):
-            inputs += ["-i", clip.path]
-            delay = max(0, round(clip.start * 1000))
-            label = f"a{i}"
-            filters.append(
-                f"[{i}:a]atrim=0:{clip.duration:.6f},asetpts=PTS-STARTPTS,"
-                f"{boundary_fade_filter(clip.duration)},adelay={delay}:all=1[{label}]"
-            )
-            labels.append(f"[{label}]")
-        filters.append(
-            f"{''.join(labels)}amix=inputs={len(labels)}:duration=longest:"
-            f"dropout_transition=0:normalize=0,alimiter=limit={MIX_LIMITER_CEILING}:"
-            "level=0:latency=1[outa]"
+        project = audio.AudioProject(
+            audio.PROJECT_VERSION, self.sample_rate, self.channels, self.clips,
+            self.total_duration(), self.loudness_lufs, self.true_peak_db, self.project_path,
         )
-        run_ffmpeg([*inputs, "-filter_complex", ";".join(filters), "-map", "[outa]", *audio_args_for(out), out])
+        command, _filters, _duration = audio.build_mix_command(project, out, overwrite=True)
+        audio.run_command(command)
 
     def preview(self) -> None:
         if not self.clips:
@@ -771,6 +835,7 @@ class MixTab(ttk.Frame):
 
 class AudioAtelierApp:
     def __init__(self) -> None:
+        ensure_data_dirs()
         self.root = tk.Tk()
         self.root.title(f"Audio Atelier {APP_VERSION} - 動画音声切り出し・音声合成")
         initial_height = min(780, max(700, self.root.winfo_screenheight() - 100))
@@ -903,5 +968,112 @@ class AudioAtelierApp:
         self.root.mainloop()
 
 
+def _write_result(result: dict, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(result, ensure_ascii=False, indent=2), flush=True)
+        return
+    operation = result.get("operation", "処理")
+    status = result.get("status", "ok")
+    output = result.get("output")
+    suffix = f": {output}" if output else ""
+    print(f"{operation} {status}{suffix}", flush=True)
+
+
+def _cli_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="AudioAtelier.exe", description="Audio AtelierのヘッドレスCLI")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {APP_VERSION}")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    probe = commands.add_parser("probe", help="動画・音声の情報を取得します")
+    probe.add_argument("--input", required=True, help="調べる動画・音声ファイル")
+    probe.add_argument("--json", action="store_true", dest="json_output", help="結果をJSONで標準出力へ返します")
+    probe.add_argument("--dry-run", action="store_true", help="ffprobeを実行せずコマンドだけを返します")
+
+    trim = commands.add_parser("trim", help="動画・音声から指定範囲の音声を書き出します")
+    trim.add_argument("--input", required=True)
+    trim.add_argument("--start", required=True, type=float, help="開始位置（秒）")
+    trim.add_argument("--end", required=True, type=float, help="終了位置（秒）")
+    trim.add_argument("--output", required=True)
+    trim.add_argument("--overwrite", action="store_true", help="既存の出力ファイルを上書きします")
+    trim.add_argument("--dry-run", action="store_true", help="FFmpegを実行せずコマンドだけを返します")
+    trim.add_argument("--json", action="store_true", dest="json_output", help="結果をJSONで標準出力へ返します")
+
+    mix = commands.add_parser("mix", help="JSONプロジェクトの音声を合成します")
+    mix.add_argument("--project", required=True, help="Audio Atelier JSONプロジェクト")
+    mix.add_argument("--output", required=True)
+    mix.add_argument("--overwrite", action="store_true", help="既存の出力ファイルを上書きします")
+    mix.add_argument("--dry-run", action="store_true", help="FFmpegを実行せずコマンドとfilter_complexだけを返します")
+    mix.add_argument("--json", action="store_true", dest="json_output", help="結果をJSONで標準出力へ返します")
+    return parser
+
+
+def cli_main(argv: list[str]) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+    parser = _cli_parser()
+    args = parser.parse_args(argv)
+    json_output = bool(getattr(args, "json_output", False))
+    try:
+        if args.command == "probe":
+            input_path = Path(args.input).expanduser().resolve()
+            if not input_path.is_file():
+                raise FileNotFoundError(f"入力ファイルが見つかりません: {input_path}")
+            command = [
+                audio.ensure_tool("ffprobe"), "-v", "error", "-show_entries",
+                "format=duration,format_name,size:stream=index,codec_type,codec_name,sample_rate,channels,channel_layout",
+                "-of", "json", str(input_path),
+            ]
+            if args.dry_run:
+                result = {
+                    "status": "dry-run", "operation": "probe", "input": str(input_path),
+                    "command": command, "command_line": audio.command_line(command), "ffprobe_exit_code": None,
+                }
+            else:
+                started = time.monotonic()
+                result = audio.probe_media(str(input_path))
+                result.update({
+                    "status": "ok", "operation": "probe", "ffprobe_exit_code": 0,
+                    "command_line": audio.command_line(result["command"]),
+                    "elapsed_seconds": round(time.monotonic() - started, 6),
+                })
+        elif args.command == "trim":
+            result = audio.trim_media(args.input, args.start, args.end, args.output, args.overwrite, args.dry_run)
+        else:
+            result = audio.mix_project(args.project, args.output, args.overwrite, args.dry_run)
+        _write_result(result, json_output)
+        return 0
+    except Exception as exc:
+        error = {
+            "status": "error",
+            "operation": args.command,
+            "error_type": type(exc).__name__,
+            "message": str(exc),
+            "ffmpeg_exit_code": getattr(exc, "returncode", None),
+        }
+        if json_output:
+            print(json.dumps(error, ensure_ascii=False, indent=2), file=sys.stderr, flush=True)
+        else:
+            print(f"エラー: {exc}", file=sys.stderr, flush=True)
+        return 1
+
+
+def _hide_own_console_when_launched_from_explorer() -> None:
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return
+    try:
+        process_ids = (ctypes.c_uint32 * 8)()
+        count = ctypes.windll.kernel32.GetConsoleProcessList(process_ids, len(process_ids))
+        if count <= 1:
+            window = ctypes.windll.kernel32.GetConsoleWindow()
+            if window:
+                ctypes.windll.user32.ShowWindow(window, 0)
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        raise SystemExit(cli_main(sys.argv[1:]))
+    _hide_own_console_when_launched_from_explorer()
     AudioAtelierApp().run()
