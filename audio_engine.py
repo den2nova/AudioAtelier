@@ -85,6 +85,25 @@ def boundary_fade_filter(duration: float, fade_in: float = AUTO_FADE_SECONDS, fa
     return ",".join(filters)
 
 
+def precise_trim_filter(start: float, end: float, apply_boundary_fade: bool = True) -> str:
+    """Decode from a normalized timeline, then trim at audio-sample precision."""
+    start = float(start)
+    end = float(end)
+    if start < 0 or end <= start:
+        raise ValueError("startは0以上、endはstartより大きい秒数を指定してください。")
+    duration = end - start
+    filters = [
+        "asetpts=PTS-STARTPTS",
+        f"atrim=start={start:.6f}:end={end:.6f}",
+        "asetpts=PTS-STARTPTS",
+    ]
+    if apply_boundary_fade:
+        fade = boundary_fade_filter(duration)
+        if fade:
+            filters.append(fade)
+    return ",".join(filters)
+
+
 def command_line(command: list[str]) -> str:
     return subprocess.list2cmdline(command)
 
@@ -161,15 +180,11 @@ def build_trim_command(input_path: str, start: float, end: float, output_path: s
         raise FileExistsError(f"出力先はすでに存在します。上書きする場合は--overwriteを付けてください: {output}")
     if not output.parent.is_dir():
         raise FileNotFoundError(f"出力先フォルダが見つかりません: {output.parent}")
-    duration = end - start
-    fade = boundary_fade_filter(duration)
     args = [
         ensure_tool("ffmpeg"), "-hide_banner", "-y" if overwrite else "-n",
-        "-ss", f"{start:.6f}", "-i", str(source), "-t", f"{duration:.6f}",
-        "-map", "0:a:0", "-vn",
+        "-i", str(source), "-map", "0:a:0", "-vn",
+        "-af", precise_trim_filter(start, end),
     ]
-    if fade:
-        args += ["-af", fade]
     return [*args, *audio_args_for(str(output)), str(output)]
 
 

@@ -22,7 +22,7 @@ from audio_engine import AudioClip
 
 
 APP_NAME = "Audio Atelier"
-APP_VERSION = "v1.2.1"
+APP_VERSION = "v1.2.3"
 AUTO_FADE_SECONDS = audio.AUTO_FADE_SECONDS
 MIX_LIMITER_CEILING = audio.MIX_LIMITER_CEILING
 BG = "#17191f"
@@ -34,6 +34,7 @@ ACCENT = "#58a6ff"
 ACCENT_2 = "#63d8c6"
 WARNING = "#ffb454"
 CLIP_COLORS = ["#3778c2", "#9472c9", "#c0628c", "#458f79", "#b27843", "#6676c8"]
+MIN_TRIM_PREVIEW_SECONDS = 0.300
 
 
 def base_dir() -> Path:
@@ -48,6 +49,12 @@ TEMP_DIR = DATA_DIR / "temp"
 def ensure_data_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True)
     TEMP_DIR.mkdir(exist_ok=True)
+    for pattern in ("trim_preview_*.wav", "mix_preview*.wav"):
+        for path in TEMP_DIR.glob(pattern):
+            try:
+                path.unlink()
+            except OSError:
+                pass
 
 
 def resource_path(relative: str) -> Path:
@@ -254,6 +261,7 @@ class TrimTab(ttk.Frame):
         self.end_var = tk.StringVar(value="0.000")
         self.status = tk.StringVar(value="動画または音声を選択してください")
         self.format_var = tk.StringVar(value="wav")
+        self.preview_serial = 0
         self._build()
 
     def _build(self) -> None:
@@ -282,7 +290,7 @@ class TrimTab(ttk.Frame):
         actions = ttk.Frame(self)
         actions.pack(fill="x")
         ttk.Button(actions, text="▶ 選択範囲を試聴", command=self.preview).pack(side="left")
-        ttk.Button(actions, text="■ 停止", command=self.app.stop_playback).pack(side="left", padx=8)
+        ttk.Button(actions, text="■ 停止", command=self.stop_preview).pack(side="left", padx=8)
         ttk.Button(actions, text="選択範囲を書き出す", command=self.export, style="Accent.TButton").pack(side="right")
         ttk.Label(self, textvariable=self.status, foreground=MUTED).pack(anchor="w", pady=(12, 0))
 
@@ -298,6 +306,8 @@ class TrimTab(ttk.Frame):
         )
         if not path:
             return
+        self.preview_serial += 1
+        self.app.stop_playback()
         self.path = path
         self.file_label.configure(text=Path(path).name)
         self.status.set("波形を解析しています…")
@@ -319,6 +329,8 @@ class TrimTab(ttk.Frame):
         messagebox.showerror(APP_NAME, str(exc))
 
     def _range_changed(self, start: float, end: float) -> None:
+        self.preview_serial += 1
+        self.app.stop_playback()
         self.start_var.set(f"{start:.3f}")
         self.end_var.set(f"{end:.3f}")
         if self.duration:
@@ -335,17 +347,63 @@ class TrimTab(ttk.Frame):
             messagebox.showwarning(APP_NAME, "開始・終了秒を正しく入力してください。")
             return False
 
+    def stop_preview(self) -> None:
+        self.preview_serial += 1
+        self.app.stop_playback()
+        self.status.set("試聴を停止しました")
+
     def preview(self) -> None:
         if not self.path or self.duration <= 0:
             messagebox.showinfo(APP_NAME, "先にファイルを読み込んでください。")
             return
         if not self.apply_entries():
             return
+        start, end = float(self.start_var.get()), float(self.end_var.get())
+        duration = end - start
+        source = self.path
+        out = str(TEMP_DIR / f"trim_preview_{uuid.uuid4().hex}.wav")
+        self.preview_serial += 1
+        serial = self.preview_serial
+        self.app.stop_playback()
+        self.status.set("選択範囲を正確に切り出しています…")
+
+        def work():
+            playback_duration = max(duration, MIN_TRIM_PREVIEW_SECONDS)
+            preview_filter = audio.precise_trim_filter(start, end)
+            if playback_duration > duration:
+                preview_filter += f",apad=pad_dur={playback_duration-duration:.6f}"
+            run_ffmpeg([
+                "-i", source, "-map", "0:a:0", "-vn",
+                "-af", preview_filter,
+                "-c:a", "pcm_s16le", out,
+            ])
+            return serial, out, start, duration, playback_duration
+
+        def failed(exc: Exception) -> None:
+            Path(out).unlink(missing_ok=True)
+            if serial == self.preview_serial:
+                self.status.set("試聴の準備に失敗しました")
+                messagebox.showerror(APP_NAME, str(exc))
+
+        self.app.jobs.submit(work, self._preview_ready, failed)
+
+    def _preview_ready(self, result) -> None:
+        serial, path, start, duration, playback_duration = result
+        if serial != self.preview_serial:
+            Path(path).unlink(missing_ok=True)
+            return
+
+        def update_playhead(position: float | None) -> None:
+            self.wave.set_playhead(None if position is None else start + min(position, duration))
+            if position is None and serial == self.preview_serial:
+                self.status.set(f"試聴終了　選択範囲 {duration:.3f} 秒")
+
+        self.status.set(f"選択範囲を再生しています（{duration:.3f} 秒）")
         self.app.play(
-            self.path,
-            float(self.start_var.get()),
-            float(self.end_var.get()) - float(self.start_var.get()),
-            self.wave.set_playhead,
+            path,
+            duration=playback_duration,
+            progress_callback=update_playhead,
+            cleanup_path=path,
         )
 
     def export(self) -> None:
@@ -363,10 +421,9 @@ class TrimTab(ttk.Frame):
         self.status.set("音声を書き出しています…")
 
         def work():
-            duration = end - start
             run_ffmpeg([
-                "-ss", f"{start:.6f}", "-i", self.path, "-t", f"{duration:.6f}",
-                "-map", "0:a:0", "-vn", "-af", boundary_fade_filter(duration),
+                "-i", self.path, "-map", "0:a:0", "-vn",
+                "-af", audio.precise_trim_filter(start, end),
                 *audio_args_for(out), out,
             ])
             return out
@@ -531,6 +588,7 @@ class MixTab(ttk.Frame):
         self.channels = 2
         self.loudness_lufs: float | None = None
         self.true_peak_db = -1.0
+        self.preview_serial = 0
         self._build()
 
     def _build(self) -> None:
@@ -580,7 +638,7 @@ class MixTab(ttk.Frame):
         actions = ttk.Frame(self)
         actions.pack(fill="x", pady=(12, 0))
         ttk.Button(actions, text="▶ 全体を試聴", command=self.preview).pack(side="left")
-        ttk.Button(actions, text="■ 停止", command=self.app.stop_playback).pack(side="left", padx=8)
+        ttk.Button(actions, text="■ 停止", command=self.stop_preview).pack(side="left", padx=8)
         ttk.Label(actions, text="出力形式").pack(side="right", padx=(12, 6))
         ttk.Combobox(actions, textvariable=self.format_var, values=("wav", "mp3", "m4a"), state="readonly", width=7).pack(side="right")
         ttk.Button(actions, text="合成音声を書き出す", command=self.export, style="Accent.TButton").pack(side="right", padx=8)
@@ -805,13 +863,42 @@ class MixTab(ttk.Frame):
         if not self.clips:
             messagebox.showinfo(APP_NAME, "先に音声ファイルを追加してください。")
             return
-        out = str(TEMP_DIR / "mix_preview.wav")
+        self.preview_serial += 1
+        serial = self.preview_serial
+        duration = self.total_duration()
+        out = str(TEMP_DIR / f"mix_preview_{uuid.uuid4().hex}.wav")
+        self.app.stop_playback()
         self.status.set("試聴用の音声を作成しています…")
-        self.app.jobs.submit(lambda: (self._render_mix(out), out)[1], self._preview_ready, lambda e: self._export_failed(e))
 
-    def _preview_ready(self, path: str) -> None:
+        def work():
+            self._render_mix(out)
+            return serial, out, duration
+
+        def failed(exc: Exception) -> None:
+            Path(out).unlink(missing_ok=True)
+            if serial == self.preview_serial:
+                self._export_failed(exc)
+
+        self.app.jobs.submit(work, self._preview_ready, failed)
+
+    def stop_preview(self) -> None:
+        self.preview_serial += 1
+        self.app.stop_playback()
+        self.status.set("試聴を停止しました")
+
+    def _preview_ready(self, result) -> None:
+        serial, path, duration = result
+        if serial != self.preview_serial:
+            Path(path).unlink(missing_ok=True)
+            return
+
+        def update_playhead(position: float | None) -> None:
+            self.timeline.set_playhead(position)
+            if position is None and serial == self.preview_serial:
+                self.status.set("合成結果の試聴が終わりました")
+
         self.status.set("合成結果を再生しています")
-        self.app.play(path, duration=self.total_duration(), progress_callback=self.timeline.set_playhead)
+        self.app.play(path, duration=duration, progress_callback=update_playhead, cleanup_path=path)
 
     def export(self) -> None:
         if not self.clips:
@@ -854,6 +941,7 @@ class AudioAtelierApp:
         self.play_started_at = 0.0
         self.play_origin = 0.0
         self.play_duration: float | None = None
+        self.play_cleanup_path: str | None = None
         self.jobs = BackgroundJobs(self.root)
         self._style()
         self._build()
@@ -911,7 +999,14 @@ class AudioAtelierApp:
         notebook.add(TrimTab(notebook, self), text="  動画から音声を切り出す  ")
         notebook.add(MixTab(notebook, self), text="  音声を合成する  ")
 
-    def play(self, path: str, start: float | None = None, duration: float | None = None, progress_callback=None) -> None:
+    def play(
+        self,
+        path: str,
+        start: float | None = None,
+        duration: float | None = None,
+        progress_callback=None,
+        cleanup_path: str | None = None,
+    ) -> None:
         self.stop_playback()
         args = [FFPLAY, "-hide_banner", "-loglevel", "error", "-nodisp", "-autoexit"]
         if start is not None:
@@ -927,10 +1022,12 @@ class AudioAtelierApp:
             self.play_started_at = time.monotonic()
             self.play_origin = start or 0.0
             self.play_duration = duration
+            self.play_cleanup_path = cleanup_path
             if self.progress_callback:
                 self.progress_callback(self.play_origin)
             self.root.after(40, lambda: self._update_playback(serial))
         except OSError as exc:
+            self._cleanup_playback_file(cleanup_path)
             messagebox.showerror(APP_NAME, f"再生を開始できませんでした。\n{exc}")
 
     def _update_playback(self, serial: int) -> None:
@@ -940,8 +1037,11 @@ class AudioAtelierApp:
             callback = self.progress_callback
             self.player = None
             self.progress_callback = None
+            cleanup_path = self.play_cleanup_path
+            self.play_cleanup_path = None
             if callback:
                 callback(None)
+            self._cleanup_playback_file(cleanup_path)
             return
         elapsed = time.monotonic() - self.play_started_at
         if self.play_duration is not None:
@@ -952,13 +1052,39 @@ class AudioAtelierApp:
 
     def stop_playback(self) -> None:
         self.playback_serial += 1
-        if self.player and self.player.poll() is None:
-            self.player.terminate()
+        player = self.player
+        if player and player.poll() is None:
+            try:
+                player.terminate()
+                player.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                try:
+                    player.kill()
+                    player.wait(timeout=0.5)
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            except OSError:
+                pass
         self.player = None
         callback = self.progress_callback
         self.progress_callback = None
+        cleanup_path = self.play_cleanup_path
+        self.play_cleanup_path = None
         if callback:
             callback(None)
+        self._cleanup_playback_file(cleanup_path)
+
+    def _cleanup_playback_file(self, path: str | None, retries: int = 5) -> None:
+        if not path:
+            return
+        try:
+            Path(path).unlink(missing_ok=True)
+        except OSError:
+            if retries > 0:
+                try:
+                    self.root.after(200, lambda: self._cleanup_playback_file(path, retries - 1))
+                except tk.TclError:
+                    pass
 
     def close(self) -> None:
         self.stop_playback()
