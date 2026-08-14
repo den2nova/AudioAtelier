@@ -22,7 +22,7 @@ from audio_engine import AudioClip
 
 
 APP_NAME = "Audio Atelier"
-APP_VERSION = "v1.2.3"
+APP_VERSION = "v1.3.0"
 AUTO_FADE_SECONDS = audio.AUTO_FADE_SECONDS
 MIX_LIMITER_CEILING = audio.MIX_LIMITER_CEILING
 BG = "#17191f"
@@ -111,6 +111,11 @@ def format_time(seconds: float) -> str:
     minutes = int(seconds // 60)
     sec = seconds - minutes * 60
     return f"{minutes:02d}:{sec:06.3f}"
+
+
+def gain_db_to_percent(gain_db: float) -> float:
+    """Convert an amplitude gain in dB to an easy-to-read percentage."""
+    return 100.0 * (10.0 ** (gain_db / 20.0))
 
 
 def audio_args_for(path: str) -> list[str]:
@@ -531,7 +536,7 @@ class TimelineCanvas(tk.Canvas):
             if clip.mute:
                 flags += "  ミュート"
             if clip.gain_db:
-                flags += f"  {clip.gain_db:+.1f}dB"
+                flags += f"  音量{gain_db_to_percent(clip.gain_db):.0f}%"
             label = f"{clip.name}  {clip.duration:.2f}s{flags}"
             self.create_text(x1 + 8, (y1 + y2) / 2, anchor="w", text=label, fill="white", tags=("clip", clip.id))
         self._draw_playhead()
@@ -762,20 +767,92 @@ class MixTab(ttk.Frame):
             "fade_in": tk.StringVar(value=f"{clip.fade_in:.3f}"),
             "fade_out": tk.StringVar(value=f"{clip.fade_out:.3f}"),
         }
-        labels = (
+        trim_labels = (
             ("音声内の開始位置（秒）", "trim_in"),
             ("音声内の終了位置（秒）", "trim_out"),
-            ("音量（dB）", "gain_db"),
+        )
+        for row, (label, key) in enumerate(trim_labels):
+            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=4)
+            ttk.Entry(frame, textvariable=values[key], width=14).grid(row=row, column=1, padx=(14, 0), pady=4)
+
+        gain_scale_var = tk.DoubleVar(value=max(-40.0, min(12.0, clip.gain_db)))
+        gain_description_var = tk.StringVar()
+
+        def update_gain_description() -> None:
+            try:
+                gain_db = float(values["gain_db"].get())
+                if not math.isfinite(gain_db):
+                    raise ValueError
+            except ValueError:
+                gain_description_var.set("dBを数値で入力してください")
+                return
+            percent = gain_db_to_percent(gain_db)
+            if abs(gain_db) < 0.005:
+                direction = "元の音量"
+            elif gain_db < 0:
+                direction = "小さくする"
+            else:
+                direction = "大きくする"
+            gain_description_var.set(f"{direction}（約{percent:.0f}% / {gain_db:+.1f} dB）")
+
+        def set_gain(gain_db: float) -> None:
+            values["gain_db"].set(f"{gain_db:.1f}")
+            gain_scale_var.set(max(-40.0, min(12.0, gain_db)))
+            update_gain_description()
+
+        def gain_scale_changed(value: str) -> None:
+            values["gain_db"].set(f"{float(value):.1f}")
+            update_gain_description()
+
+        def gain_entry_changed(_event=None) -> None:
+            try:
+                gain_db = float(values["gain_db"].get())
+                if math.isfinite(gain_db):
+                    gain_scale_var.set(max(-40.0, min(12.0, gain_db)))
+            except ValueError:
+                pass
+            update_gain_description()
+
+        ttk.Label(frame, text="音量調整").grid(row=2, column=0, sticky="w", pady=(12, 4))
+        gain_entry_frame = ttk.Frame(frame)
+        gain_entry_frame.grid(row=2, column=1, sticky="e", padx=(14, 0), pady=(12, 4))
+        gain_entry = ttk.Entry(gain_entry_frame, textvariable=values["gain_db"], width=9)
+        gain_entry.pack(side="left")
+        ttk.Label(gain_entry_frame, text="dB").pack(side="left", padx=(5, 0))
+        gain_entry.bind("<KeyRelease>", gain_entry_changed)
+        gain_entry.bind("<FocusOut>", gain_entry_changed)
+        ttk.Scale(
+            frame,
+            from_=-40.0,
+            to=12.0,
+            variable=gain_scale_var,
+            command=gain_scale_changed,
+            length=310,
+        ).grid(row=3, column=0, columnspan=2, sticky="ew", pady=(2, 3))
+        ttk.Label(frame, textvariable=gain_description_var).grid(row=4, column=0, columnspan=2, sticky="w")
+        ttk.Label(
+            frame,
+            text="0 dB＝元の音量。マイナスで小さく、プラスで大きくなります。",
+            foreground=MUTED,
+        ).grid(row=5, column=0, columnspan=2, sticky="w", pady=(2, 6))
+        presets = ttk.Frame(frame)
+        presets.grid(row=6, column=0, columnspan=2, sticky="w", pady=(0, 8))
+        for text, gain_db in (("小さく -12", -12.0), ("少し小さく -6", -6.0), ("元の音量 0", 0.0), ("少し大きく +3", 3.0)):
+            ttk.Button(presets, text=text, command=lambda value=gain_db: set_gain(value)).pack(side="left", padx=(0, 5))
+
+        fade_labels = (
             ("フェードイン（秒）", "fade_in"),
             ("フェードアウト（秒）", "fade_out"),
         )
-        for row, (label, key) in enumerate(labels):
+        for row, (label, key) in enumerate(fade_labels, start=7):
             ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w", pady=4)
             ttk.Entry(frame, textvariable=values[key], width=14).grid(row=row, column=1, padx=(14, 0), pady=4)
+        update_gain_description()
+
         loop_var = tk.BooleanVar(value=clip.loop)
         mute_var = tk.BooleanVar(value=clip.mute)
-        ttk.Checkbutton(frame, text="プロジェクトの終端までループ", variable=loop_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=(8, 2))
-        ttk.Checkbutton(frame, text="ミュート", variable=mute_var).grid(row=6, column=0, columnspan=2, sticky="w", pady=2)
+        ttk.Checkbutton(frame, text="プロジェクトの終端までループ", variable=loop_var).grid(row=9, column=0, columnspan=2, sticky="w", pady=(8, 2))
+        ttk.Checkbutton(frame, text="ミュート", variable=mute_var).grid(row=10, column=0, columnspan=2, sticky="w", pady=2)
 
         def apply_details() -> None:
             try:
@@ -805,7 +882,7 @@ class MixTab(ttk.Frame):
             dialog.destroy()
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=7, column=0, columnspan=2, sticky="e", pady=(14, 0))
+        buttons.grid(row=11, column=0, columnspan=2, sticky="e", pady=(14, 0))
         ttk.Button(buttons, text="キャンセル", command=dialog.destroy).pack(side="left")
         ttk.Button(buttons, text="反映", command=apply_details, style="Accent.TButton").pack(side="left", padx=(8, 0))
         dialog.grab_set()
