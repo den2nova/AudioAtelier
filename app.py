@@ -16,13 +16,14 @@ import uuid
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+from tkinterdnd2 import DND_FILES, TkinterDnD
 
 import audio_engine as audio
 from audio_engine import AudioClip
 
 
 APP_NAME = "Audio Atelier"
-APP_VERSION = "v1.3.0"
+APP_VERSION = "v1.4.0"
 AUTO_FADE_SECONDS = audio.AUTO_FADE_SECONDS
 MIX_LIMITER_CEILING = audio.MIX_LIMITER_CEILING
 BG = "#17191f"
@@ -35,6 +36,9 @@ ACCENT_2 = "#63d8c6"
 WARNING = "#ffb454"
 CLIP_COLORS = ["#3778c2", "#9472c9", "#c0628c", "#458f79", "#b27843", "#6676c8"]
 MIN_TRIM_PREVIEW_SECONDS = 0.300
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".wmv", ".mpeg", ".mpg"}
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".wma", ".opus"}
+MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
 
 
 def base_dir() -> Path:
@@ -116,6 +120,16 @@ def format_time(seconds: float) -> str:
 def gain_db_to_percent(gain_db: float) -> float:
     """Convert an amplitude gain in dB to an easy-to-read percentage."""
     return 100.0 * (10.0 ** (gain_db / 20.0))
+
+
+def supported_media_paths(paths) -> list[str]:
+    """Return existing supported media files while preserving drop order."""
+    accepted: list[str] = []
+    for value in paths:
+        path = Path(value)
+        if path.is_file() and path.suffix.lower() in MEDIA_EXTENSIONS:
+            accepted.append(str(path.resolve()))
+    return accepted
 
 
 def audio_args_for(path: str) -> list[str]:
@@ -264,7 +278,7 @@ class TrimTab(ttk.Frame):
         self.duration = 0.0
         self.start_var = tk.StringVar(value="0.000")
         self.end_var = tk.StringVar(value="0.000")
-        self.status = tk.StringVar(value="動画または音声を選択してください")
+        self.status = tk.StringVar(value="動画または音声を選択するか、画面へドラッグ＆ドロップしてください")
         self.format_var = tk.StringVar(value="wav")
         self.preview_serial = 0
         self._build()
@@ -273,7 +287,7 @@ class TrimTab(ttk.Frame):
         top = ttk.Frame(self)
         top.pack(fill="x")
         ttk.Button(top, text="動画・音声を選択", command=self.choose_file, style="Accent.TButton").pack(side="left")
-        self.file_label = ttk.Label(top, text="未選択", foreground=MUTED)
+        self.file_label = ttk.Label(top, text="未選択（画面へドラッグ＆ドロップ可）", foreground=MUTED)
         self.file_label.pack(side="left", padx=12, fill="x", expand=True)
 
         ttk.Label(self, text="波形の左右ハンドルをドラッグして、切り出す範囲を指定します。", foreground=MUTED).pack(anchor="w", pady=(18, 7))
@@ -311,6 +325,9 @@ class TrimTab(ttk.Frame):
         )
         if not path:
             return
+        self.load_file(path)
+
+    def load_file(self, path: str) -> None:
         self.preview_serial += 1
         self.app.stop_playback()
         self.path = path
@@ -586,7 +603,7 @@ class MixTab(ttk.Frame):
         self.lane_var = tk.StringVar(value="1")
         self.zoom_var = tk.DoubleVar(value=30)
         self.format_var = tk.StringVar(value="wav")
-        self.status = tk.StringVar(value="音声ファイルを追加してください")
+        self.status = tk.StringVar(value="音声・動画を追加するか、画面へドラッグ＆ドロップしてください")
         self.project_path: str | None = None
         self.project_duration: float | None = None
         self.sample_rate = 48000
@@ -599,7 +616,7 @@ class MixTab(ttk.Frame):
     def _build(self) -> None:
         toolbar = ttk.Frame(self)
         toolbar.pack(fill="x")
-        ttk.Button(toolbar, text="＋ 音声を追加", command=self.add_files, style="Accent.TButton").pack(side="left")
+        ttk.Button(toolbar, text="＋ 音声・動画を追加", command=self.add_files, style="Accent.TButton").pack(side="left")
         ttk.Button(toolbar, text="選択を削除", command=self.delete_selected).pack(side="left", padx=8)
         ttk.Button(toolbar, text="すべて消去", command=self.clear_all).pack(side="left")
         ttk.Button(toolbar, text="JSONを開く", command=self.open_project).pack(side="left", padx=(16, 8))
@@ -607,7 +624,7 @@ class MixTab(ttk.Frame):
         ttk.Label(toolbar, text="ズーム").pack(side="right", padx=(14, 5))
         ttk.Scale(toolbar, from_=5, to=100, variable=self.zoom_var, command=lambda v: self.timeline.set_zoom(float(v)), length=160).pack(side="right")
 
-        ttk.Label(self, text="クリップを左右に動かすと開始時間、上下に動かすとレーンが変わります。時間が重なる部分は同時に鳴ります。", foreground=MUTED).pack(anchor="w", pady=(14, 7))
+        ttk.Label(self, text="音声・動画は画面へドロップしても追加できます。左右で開始時間、上下でレーンが変わります。", foreground=MUTED).pack(anchor="w", pady=(14, 7))
         holder = ttk.Frame(self)
         holder.pack(fill="x")
         # 秒数目盛りと4レーンがちょうど収まる高さ。5レーン目以降は縦スクロールで表示する。
@@ -651,11 +668,20 @@ class MixTab(ttk.Frame):
 
     def add_files(self) -> None:
         paths = filedialog.askopenfilenames(
-            title="音声ファイルを追加",
-            filetypes=[("音声", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.wma *.opus"), ("すべて", "*.*")],
+            title="音声・動画ファイルを追加",
+            filetypes=[
+                ("動画・音声", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.wmv *.mpeg *.mpg *.mp3 *.wav *.m4a *.aac *.flac *.ogg *.wma *.opus"),
+                ("音声", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg *.wma *.opus"),
+                ("動画", "*.mp4 *.mov *.mkv *.avi *.webm *.m4v *.wmv *.mpeg *.mpg"),
+                ("すべて", "*.*"),
+            ],
         )
         if not paths:
             return
+        self.add_paths(paths)
+
+    def add_paths(self, paths) -> None:
+        paths = list(paths)
         self.status.set(f"{len(paths)} 個のファイルを解析しています…")
 
         def load():
@@ -1000,7 +1026,7 @@ class MixTab(ttk.Frame):
 class AudioAtelierApp:
     def __init__(self) -> None:
         ensure_data_dirs()
-        self.root = tk.Tk()
+        self.root = TkinterDnD.Tk()
         self.root.title(f"Audio Atelier {APP_VERSION} - 動画音声切り出し・音声合成")
         initial_height = min(780, max(700, self.root.winfo_screenheight() - 100))
         self.root.geometry(f"1100x{initial_height}")
@@ -1022,6 +1048,8 @@ class AudioAtelierApp:
         self.jobs = BackgroundJobs(self.root)
         self._style()
         self._build()
+        self.root.drop_target_register(DND_FILES)
+        self.root.dnd_bind("<<Drop>>", self._drop_event)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(250, self._check_ffmpeg)
 
@@ -1071,10 +1099,31 @@ class AudioAtelierApp:
         ttk.Label(header, text="Audio Atelier", font=("Yu Gothic UI", 20, "bold")).pack(side="left")
         ttk.Label(header, text=APP_VERSION, foreground=ACCENT_2, font=("Yu Gothic UI", 11, "bold")).pack(side="left", padx=(9, 0), pady=(8, 0))
         ttk.Label(header, text="動画音声の切り出し・音声タイムライン合成", foreground=MUTED).pack(side="left", padx=16, pady=(7, 0))
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True, padx=12, pady=(0, 12))
-        notebook.add(TrimTab(notebook, self), text="  動画から音声を切り出す  ")
-        notebook.add(MixTab(notebook, self), text="  音声を合成する  ")
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+        self.trim_tab = TrimTab(self.notebook, self)
+        self.mix_tab = MixTab(self.notebook, self)
+        self.notebook.add(self.trim_tab, text="  動画から音声を切り出す  ")
+        self.notebook.add(self.mix_tab, text="  音声を合成する  ")
+
+    def _files_dropped(self, paths) -> None:
+        accepted = supported_media_paths(paths)
+        if not accepted:
+            messagebox.showwarning(
+                APP_NAME,
+                "対応している動画・音声ファイルが見つかりませんでした。",
+                parent=self.root,
+            )
+            return
+        if self.notebook.select() == str(self.trim_tab):
+            self.trim_tab.load_file(accepted[0])
+            if len(accepted) > 1:
+                self.trim_tab.status.set(f"複数ファイルのうち先頭を読み込み中: {Path(accepted[0]).name}")
+        else:
+            self.mix_tab.add_paths(accepted)
+
+    def _drop_event(self, event) -> None:
+        self._files_dropped(self.root.tk.splitlist(event.data))
 
     def play(
         self,

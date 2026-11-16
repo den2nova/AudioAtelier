@@ -1,4 +1,4 @@
-# Audio Atelier v1.3.0
+# Audio Atelier v1.4.0
 
 動画から必要な音声を切り出し、複数の音声をタイムライン上で並べたり重ねたりできるWindows用デスクトップアプリです。
 
@@ -9,6 +9,7 @@
 ## 主な機能
 
 - 動画・音声ファイルの波形表示
+- 動画・音声ファイルのドラッグ＆ドロップ読込
 - 波形上での切り出し範囲指定と試聴
 - 複数音声の連結、無音時間の調整、重ね合わせ
 - タイムライン上での開始位置・レーン変更
@@ -24,6 +25,11 @@
 - インストール不要の単一EXEビルド
 
 ## 更新履歴
+
+### v1.4.0
+
+- 動画・音声ファイルを画面へドラッグ＆ドロップして読み込めるように変更
+- 合成タブで、複数の動画・音声ファイルをまとめてドロップ可能に変更
 
 ### v1.3.0
 
@@ -74,7 +80,7 @@
 
 ソースコードは、このページの「Code」からZIP形式でダウンロードできます。
 
-すぐに使えるビルド済みWindows版は、右側の[Releases](../../releases)から`AudioAtelier-v1.3.0-Windows.zip`をダウンロードしてください。配布ZIPには`AudioAtelier.exe`と詳しい`README.txt`が入っています。
+すぐに使えるビルド済みWindows版は、右側の[Releases](../../releases)から`AudioAtelier-v1.4.0-Windows.zip`をダウンロードしてください。配布ZIPには`AudioAtelier.exe`と詳しい`README.txt`が入っています。
 
 ## 必要環境
 
@@ -102,10 +108,11 @@ winget install --id Gyan.FFmpeg.Essentials -e
 ## ソースから実行する
 
 ```powershell
+python -m pip install -r requirements.txt
 python app.py
 ```
 
-GUIはPython標準のTkinterを使用しています。音声処理は外部のFFmpegコマンドを呼び出します。
+GUIはTkinterとtkinterdnd2を使用しています。音声処理は外部のFFmpegコマンドを呼び出します。
 
 ## CodexやPowerShellからCLIで使う
 
