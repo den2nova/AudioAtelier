@@ -108,10 +108,11 @@ winget install --id Gyan.FFmpeg.Essentials -e
 ## ソースから実行する
 
 ```powershell
+python -m pip install -r requirements.txt
 python app.py
 ```
 
-GUIはPython標準のTkinterを使用しています。音声処理は外部のFFmpegコマンドを呼び出します。
+GUIはTkinterとtkinterdnd2を使用しています。音声処理は外部のFFmpegコマンドを呼び出します。
 
 ## CodexやPowerShellからCLIで使う
 

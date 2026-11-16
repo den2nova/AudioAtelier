@@ -16,7 +16,7 @@ import uuid
 from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from ctypes import wintypes
+from tkinterdnd2 import DND_FILES, TkinterDnD
 
 import audio_engine as audio
 from audio_engine import AudioClip
@@ -169,95 +169,6 @@ class BackgroundJobs:
         except queue.Empty:
             pass
         self.root.after(100, self._poll)
-
-
-class WindowsFileDrop:
-    """Receive Explorer file drops without adding a runtime dependency."""
-
-    WM_DROPFILES = 0x0233
-    GWLP_WNDPROC = -4
-
-    def __init__(self, root: tk.Tk, callback) -> None:
-        self.root = root
-        self.callback = callback
-        self.enabled = False
-        self.hwnd = 0
-        self.old_wndproc = 0
-        self._wndproc_callback = None
-        if sys.platform == "win32":
-            self._enable()
-
-    def _enable(self) -> None:
-        self.root.update_idletasks()
-        user32 = ctypes.WinDLL("user32", use_last_error=True)
-        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
-        child_hwnd = self.root.winfo_id()
-        hwnd = user32.GetParent(child_hwnd) or child_hwnd
-
-        lresult = ctypes.c_ssize_t
-        wndproc_type = ctypes.WINFUNCTYPE(
-            lresult,
-            wintypes.HWND,
-            wintypes.UINT,
-            wintypes.WPARAM,
-            wintypes.LPARAM,
-        )
-        set_wndproc = getattr(user32, "SetWindowLongPtrW", user32.SetWindowLongW)
-        set_wndproc.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
-        set_wndproc.restype = ctypes.c_void_p
-        user32.CallWindowProcW.argtypes = [
-            ctypes.c_void_p,
-            wintypes.HWND,
-            wintypes.UINT,
-            wintypes.WPARAM,
-            wintypes.LPARAM,
-        ]
-        user32.CallWindowProcW.restype = lresult
-        shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
-        shell32.DragQueryFileW.argtypes = [wintypes.HANDLE, wintypes.UINT, wintypes.LPWSTR, wintypes.UINT]
-        shell32.DragQueryFileW.restype = wintypes.UINT
-        shell32.DragFinish.argtypes = [wintypes.HANDLE]
-
-        def window_proc(message_hwnd, message, wparam, lparam):
-            if message == self.WM_DROPFILES:
-                paths: list[str] = []
-                try:
-                    count = shell32.DragQueryFileW(wparam, 0xFFFFFFFF, None, 0)
-                    for index in range(count):
-                        length = shell32.DragQueryFileW(wparam, index, None, 0)
-                        buffer = ctypes.create_unicode_buffer(length + 1)
-                        shell32.DragQueryFileW(wparam, index, buffer, length + 1)
-                        paths.append(buffer.value)
-                finally:
-                    shell32.DragFinish(wparam)
-                if paths:
-                    self.root.after(0, lambda dropped=paths: self.callback(dropped))
-                return 0
-            return user32.CallWindowProcW(self.old_wndproc, message_hwnd, message, wparam, lparam)
-
-        self._wndproc_callback = wndproc_type(window_proc)
-        ctypes.set_last_error(0)
-        old_wndproc = set_wndproc(
-            hwnd,
-            self.GWLP_WNDPROC,
-            ctypes.cast(self._wndproc_callback, ctypes.c_void_p),
-        )
-        if not old_wndproc and ctypes.get_last_error():
-            raise ctypes.WinError(ctypes.get_last_error())
-        shell32.DragAcceptFiles(hwnd, True)
-        self.hwnd = hwnd
-        self.old_wndproc = old_wndproc
-        self._user32 = user32
-        self._shell32 = shell32
-        self._set_wndproc = set_wndproc
-        self.enabled = True
-
-    def close(self) -> None:
-        if not self.enabled:
-            return
-        self._shell32.DragAcceptFiles(self.hwnd, False)
-        self._set_wndproc(self.hwnd, self.GWLP_WNDPROC, self.old_wndproc)
-        self.enabled = False
 
 
 class WaveformCanvas(tk.Canvas):
@@ -1115,7 +1026,7 @@ class MixTab(ttk.Frame):
 class AudioAtelierApp:
     def __init__(self) -> None:
         ensure_data_dirs()
-        self.root = tk.Tk()
+        self.root = TkinterDnD.Tk()
         self.root.title(f"Audio Atelier {APP_VERSION} - 動画音声切り出し・音声合成")
         initial_height = min(780, max(700, self.root.winfo_screenheight() - 100))
         self.root.geometry(f"1100x{initial_height}")
@@ -1137,10 +1048,8 @@ class AudioAtelierApp:
         self.jobs = BackgroundJobs(self.root)
         self._style()
         self._build()
-        try:
-            self.file_drop = WindowsFileDrop(self.root, self._files_dropped)
-        except OSError:
-            self.file_drop = None
+        self.root.drop_target_register(DND_FILES)
+        self.root.dnd_bind("<<Drop>>", self._drop_event)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(250, self._check_ffmpeg)
 
@@ -1212,6 +1121,9 @@ class AudioAtelierApp:
                 self.trim_tab.status.set(f"複数ファイルのうち先頭を読み込み中: {Path(accepted[0]).name}")
         else:
             self.mix_tab.add_paths(accepted)
+
+    def _drop_event(self, event) -> None:
+        self._files_dropped(self.root.tk.splitlist(event.data))
 
     def play(
         self,
@@ -1302,8 +1214,6 @@ class AudioAtelierApp:
 
     def close(self) -> None:
         self.stop_playback()
-        if self.file_drop:
-            self.file_drop.close()
         self.root.destroy()
 
     def run(self) -> None:

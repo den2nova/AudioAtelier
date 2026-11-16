@@ -2,7 +2,7 @@ $ErrorActionPreference = "Stop"
 $ProjectDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $DistDir = Join-Path $ProjectDir "dist"
 
-python -m pip install --disable-pip-version-check pyinstaller
+python -m pip install --disable-pip-version-check pyinstaller -r (Join-Path $ProjectDir "requirements.txt")
 python -m PyInstaller `
     --noconfirm `
     --clean `
