@@ -23,7 +23,7 @@ from audio_engine import AudioClip
 
 
 APP_NAME = "Audio Atelier"
-APP_VERSION = "v1.4.0"
+APP_VERSION = "v1.5.0"
 AUTO_FADE_SECONDS = audio.AUTO_FADE_SECONDS
 MIX_LIMITER_CEILING = audio.MIX_LIMITER_CEILING
 BG = "#17191f"
@@ -120,6 +120,14 @@ def format_time(seconds: float) -> str:
 def gain_db_to_percent(gain_db: float) -> float:
     """Convert an amplitude gain in dB to an easy-to-read percentage."""
     return 100.0 * (10.0 ** (gain_db / 20.0))
+
+
+def trim_filter_with_fades(start: float, end: float, fade_in: float, fade_out: float) -> str:
+    filters = [audio.precise_trim_filter(start, end, apply_boundary_fade=False)]
+    fades = audio.boundary_fade_filter(end - start, fade_in, fade_out)
+    if fades:
+        filters.append(fades)
+    return ",".join(filters)
 
 
 def supported_media_paths(paths) -> list[str]:
@@ -278,6 +286,8 @@ class TrimTab(ttk.Frame):
         self.duration = 0.0
         self.start_var = tk.StringVar(value="0.000")
         self.end_var = tk.StringVar(value="0.000")
+        self.fade_in_var = tk.StringVar(value=f"{AUTO_FADE_SECONDS:.3f}")
+        self.fade_out_var = tk.StringVar(value=f"{AUTO_FADE_SECONDS:.3f}")
         self.status = tk.StringVar(value="動画または音声を選択するか、画面へドラッグ＆ドロップしてください")
         self.format_var = tk.StringVar(value="wav")
         self.preview_serial = 0
@@ -305,6 +315,14 @@ class TrimTab(ttk.Frame):
         ttk.Button(controls, text="数値を反映", command=self.apply_entries).pack(side="left")
         ttk.Label(controls, text="出力形式").pack(side="left", padx=(28, 7))
         ttk.Combobox(controls, textvariable=self.format_var, values=("wav", "mp3", "m4a"), state="readonly", width=7).pack(side="left")
+
+        fades = ttk.Frame(self)
+        fades.pack(fill="x", pady=(0, 14))
+        ttk.Label(fades, text="フェードイン（秒）").pack(side="left")
+        ttk.Entry(fades, textvariable=self.fade_in_var, width=9).pack(side="left", padx=(7, 18))
+        ttk.Label(fades, text="フェードアウト（秒）").pack(side="left")
+        ttk.Entry(fades, textvariable=self.fade_out_var, width=9).pack(side="left", padx=(7, 14))
+        ttk.Label(fades, text="0で無効。初期値の0.010秒は境界ノイズを抑える設定です。", foreground=MUTED).pack(side="left")
 
         actions = ttk.Frame(self)
         actions.pack(fill="x")
@@ -369,6 +387,17 @@ class TrimTab(ttk.Frame):
             messagebox.showwarning(APP_NAME, "開始・終了秒を正しく入力してください。")
             return False
 
+    def fade_values(self) -> tuple[float, float] | None:
+        try:
+            fade_in = float(self.fade_in_var.get())
+            fade_out = float(self.fade_out_var.get())
+            if not all(math.isfinite(value) and value >= 0 for value in (fade_in, fade_out)):
+                raise ValueError
+            return fade_in, fade_out
+        except ValueError:
+            messagebox.showwarning(APP_NAME, "フェードイン・アウトは0以上の秒数で入力してください。")
+            return None
+
     def stop_preview(self) -> None:
         self.preview_serial += 1
         self.app.stop_playback()
@@ -380,7 +409,11 @@ class TrimTab(ttk.Frame):
             return
         if not self.apply_entries():
             return
+        fade_values = self.fade_values()
+        if fade_values is None:
+            return
         start, end = float(self.start_var.get()), float(self.end_var.get())
+        fade_in, fade_out = fade_values
         duration = end - start
         source = self.path
         out = str(TEMP_DIR / f"trim_preview_{uuid.uuid4().hex}.wav")
@@ -391,7 +424,7 @@ class TrimTab(ttk.Frame):
 
         def work():
             playback_duration = max(duration, MIN_TRIM_PREVIEW_SECONDS)
-            preview_filter = audio.precise_trim_filter(start, end)
+            preview_filter = trim_filter_with_fades(start, end, fade_in, fade_out)
             if playback_duration > duration:
                 preview_filter += f",apad=pad_dur={playback_duration-duration:.6f}"
             run_ffmpeg([
@@ -434,18 +467,22 @@ class TrimTab(ttk.Frame):
             return
         if not self.apply_entries():
             return
+        fade_values = self.fade_values()
+        if fade_values is None:
+            return
         fmt = self.format_var.get()
         suggested = f"{Path(self.path).stem}_trim.{fmt}"
         out = filedialog.asksaveasfilename(title="音声を書き出す", defaultextension=f".{fmt}", initialfile=suggested, filetypes=[(fmt.upper(), f"*.{fmt}")])
         if not out:
             return
         start, end = float(self.start_var.get()), float(self.end_var.get())
+        fade_in, fade_out = fade_values
         self.status.set("音声を書き出しています…")
 
         def work():
             run_ffmpeg([
                 "-i", self.path, "-map", "0:a:0", "-vn",
-                "-af", audio.precise_trim_filter(start, end),
+                "-af", trim_filter_with_fades(start, end, fade_in, fade_out),
                 *audio_args_for(out), out,
             ])
             return out
@@ -1103,7 +1140,7 @@ class AudioAtelierApp:
         self.notebook.pack(fill="both", expand=True, padx=12, pady=(0, 12))
         self.trim_tab = TrimTab(self.notebook, self)
         self.mix_tab = MixTab(self.notebook, self)
-        self.notebook.add(self.trim_tab, text="  動画から音声を切り出す  ")
+        self.notebook.add(self.trim_tab, text="  音声を切り出す  ")
         self.notebook.add(self.mix_tab, text="  音声を合成する  ")
 
     def _files_dropped(self, paths) -> None:
