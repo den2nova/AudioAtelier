@@ -6,7 +6,7 @@ python -m pip install --disable-pip-version-check pyinstaller -r (Join-Path $Pro
 python -m PyInstaller `
     --noconfirm `
     --clean `
-    --console `
+    --windowed `
     --onefile `
     --name AudioAtelier `
     --icon (Join-Path $ProjectDir "assets\audio_atelier.ico") `

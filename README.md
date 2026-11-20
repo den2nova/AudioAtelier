@@ -1,4 +1,4 @@
-# Audio Atelier v1.5.0
+# Audio Atelier v1.6.0
 
 動画から必要な音声を切り出し、複数の音声をタイムライン上で並べたり重ねたりできるWindows用デスクトップアプリです。
 
@@ -14,8 +14,8 @@
 - 切り出し音声のフェードイン・フェードアウト調整
 - 複数音声の連結、無音時間の調整、重ね合わせ
 - タイムライン上での開始位置・レーン変更
-- WAV・MP3・M4A形式での書き出し
-- 再生位置を示すプレイヘッド
+- WAV・MP3・M4A・OGG（Vorbis）形式での書き出し
+- 切り出し・合成のループ試聴と、再生位置を指定できるバー
 - 切り出し範囲と合成クリップ両端への約10msの自動フェード
 - 合成時のピーク超過を抑えるリミッター
 - GUIとCLIで共通利用できるJSONプロジェクト
@@ -26,6 +26,21 @@
 - インストール不要の単一EXEビルド
 
 ## 更新履歴
+
+### v1.6.0
+
+- 合成画面では、移動したクリップが同じレーンのほかのクリップに重ならないように配置。端同士を隙間なくつなぐことも可能
+- 切り出し・合成ともに、保存時の「ファイルの種類」から4形式を選択可能。OGG（Vorbis）を追加
+- 書き出しボタン左の「圧縮品質」で「軽量」「標準（おすすめ）」「高音質」を選択。保存ダイアログでは形式のみを指定。WAVは常に非圧縮
+- EXEの通常起動時に、黒いコンソール画面が一瞬表示される問題を修正
+- 両方のタブでループ試聴に対応。ループ中に通常の試聴ボタンを押すと、先頭から1回だけ再生
+- 両タブで時間目盛りをクリックして再生位置を指定し、押したままドラッグして調整可能
+- 切り出し画面では目盛りのクリックでも再生位置を指定可能。範囲外なら近い方の端に移動
+- 切り出し波形・合成タイムラインともに、カーソル位置を基準にホイールで拡大・縮小。合成画面のズームバーを削除
+- 拡大中は波形下のバーを左右にドラッグして表示位置を移動。切り出し範囲や再生位置はそのまま
+- 波形の下に突き出た切り出しハンドルはドラッグでのみ移動。範囲変更で再生位置が範囲外になった場合だけ新しい開始位置へ移動
+- 「繋ぎ目を確認」で終端の3秒前から再生し、そのまま範囲全体をループ。3秒以下なら先頭から再生
+- 一時停止は現在位置を保持。停止は切り出し範囲の先頭（合成では0秒）へ移動
 
 ### v1.5.0
 
@@ -87,7 +102,7 @@
 
 ソースコードは、このページの「Code」からZIP形式でダウンロードできます。
 
-すぐに使えるビルド済みWindows版は、右側の[Releases](../../releases)から`AudioAtelier-v1.5.0-Windows.zip`をダウンロードしてください。配布ZIPには`AudioAtelier.exe`と詳しい`README.txt`が入っています。
+すぐに使えるビルド済みWindows版は、右側の[Releases](../../releases)からファイル名が `-Windows.zip` で終わるZIPをダウンロードしてください。配布ZIPには`AudioAtelier.exe`と詳しい`README.txt`が入っています。
 
 ## 必要環境
 
@@ -123,18 +138,20 @@ GUIはTkinterとtkinterdnd2を使用しています。音声処理は外部のFF
 
 ## CodexやPowerShellからCLIで使う
 
-引数を付けずに起動するとGUIが開きます。サブコマンドを指定した場合はGUIを開かず、処理完了まで待って終了コードと結果を返します。
+引数なしならGUI、サブコマンドを指定すればCLIで起動します。PowerShellで結果を画面に表示するには、次のように末尾に `2>&1 | Out-Host` を付けてください。GUI用のEXEなので、対話端末で直接起動するだけでは完了を待たない場合があります。
 
 ```powershell
-AudioAtelier.exe probe --input input.mp4 --json
+.\AudioAtelier.exe probe --input input.mp4 --json 2>&1 | Out-Host
 
-AudioAtelier.exe trim `
+.\AudioAtelier.exe trim `
   --input input.mp4 --start 12.5 --end 18.2 `
-  --output voice.wav --json
+  --output voice.wav --json 2>&1 | Out-Host
 
-AudioAtelier.exe mix `
-  --project project.json --output final_mix.wav --json
+.\AudioAtelier.exe mix `
+  --project project.json --output final_mix.wav --json 2>&1 | Out-Host
 ```
+
+終了コードは直後の `$LASTEXITCODE` で確認できます。プログラムからは従来どおり、EXEの終了を待ち、標準出力と標準エラーを別々に取得してください。
 
 `--dry-run`ではFFmpegコマンドと`filter_complex`を処理前に確認できます。既存ファイルを上書きする場合は`--overwrite`を明示します。JSONプロジェクトのフィールドと実行例は[README.txt](README.txt)を参照してください。
 
@@ -152,7 +169,7 @@ PowerShellで次を実行します。
 
 - 動画入力：MP4、MOV、MKV、AVI、WebM、M4V、WMV、MPEG、MPG
 - 音声入力：WAV、MP3、M4A、AAC、FLAC、OGG、WMA、Opus
-- 音声出力：WAV、MP3、M4A
+- 音声出力：WAV、MP3、M4A、OGG（Vorbis）。CLIでは出力ファイルの拡張子で指定します。
 
 実際に読み込める形式は、使用しているFFmpegのビルドに準じます。
 

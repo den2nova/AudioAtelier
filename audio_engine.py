@@ -16,6 +16,14 @@ from typing import Any
 AUTO_FADE_SECONDS = 0.010
 MIX_LIMITER_CEILING = 0.95
 PROJECT_VERSION = 1
+OUTPUT_ENCODERS = {
+    "wav": "pcm_s16le", "mp3": "libmp3lame", "m4a": "aac", "ogg": "libvorbis",
+}
+QUALITY_OPTIONS = {
+    "mp3": ("-q:a", {"standard": "2", "small": "5", "high": "0"}),
+    "m4a": ("-b:a", {"standard": "256k", "small": "128k", "high": "320k"}),
+    "ogg": ("-q:a", {"standard": "5", "small": "2", "high": "8"}),
+}
 
 
 def base_dir() -> Path:
@@ -62,15 +70,17 @@ def ensure_tool(name: str) -> str:
     return found
 
 
-def audio_args_for(path: str) -> list[str]:
-    ext = Path(path).suffix.lower()
-    if ext == ".wav":
-        return ["-c:a", "pcm_s16le"]
-    if ext == ".mp3":
-        return ["-c:a", "libmp3lame", "-q:a", "2"]
-    if ext == ".m4a":
-        return ["-c:a", "aac", "-b:a", "256k"]
-    raise ValueError("出力形式はwav、mp3、m4aのいずれかを指定してください。")
+def audio_args_for(path: str, quality: str = "standard") -> list[str]:
+    ext = Path(path).suffix[1:].lower()
+    if ext not in OUTPUT_ENCODERS:
+        raise ValueError(f"出力形式は{'、'.join(OUTPUT_ENCODERS)}のいずれかを指定してください。")
+    args = ["-c:a", OUTPUT_ENCODERS[ext]]
+    if ext in QUALITY_OPTIONS:
+        option, levels = QUALITY_OPTIONS[ext]
+        if quality not in levels:
+            raise ValueError(f"未対応の圧縮品質です: {quality}")
+        args.extend((option, levels[quality]))
+    return args
 
 
 def boundary_fade_filter(duration: float, fade_in: float = AUTO_FADE_SECONDS, fade_out: float = AUTO_FADE_SECONDS) -> str:
@@ -364,7 +374,7 @@ def project_total_duration(project: AudioProject) -> float:
     return max(total, non_loop_end)
 
 
-def build_mix_command(project: AudioProject, output_path: str, overwrite: bool = False) -> tuple[list[str], str, float]:
+def build_mix_command(project: AudioProject, output_path: str, overwrite: bool = False, *, quality: str = "standard") -> tuple[list[str], str, float]:
     output = Path(output_path).expanduser().resolve()
     if output.exists() and not overwrite:
         raise FileExistsError(f"出力先はすでに存在します。上書きする場合は--overwriteを付けてください: {output}")
@@ -394,8 +404,10 @@ def build_mix_command(project: AudioProject, output_path: str, overwrite: bool =
         fades = boundary_fade_filter(play_duration, clip.fade_in, clip.fade_out)
         if fades:
             chain.append(fades)
-        delay = max(0, round(clip.start * 1000))
-        chain.append(f"adelay={delay}:all=1")
+        # Use project-rate samples for placement; millisecond rounding can
+        # leave an audible gap/overlap even when two edges coincide in the GUI.
+        delay = max(0, round(clip.start * project.sample_rate))
+        chain.extend([f"aresample={project.sample_rate}", f"adelay={delay}S:all=1"])
         label = f"a{index}"
         filters.append(f"[{index}:a]{','.join(chain)}[{label}]")
         labels.append(f"[{label}]")
@@ -412,7 +424,7 @@ def build_mix_command(project: AudioProject, output_path: str, overwrite: bool =
     command = [
         ensure_tool("ffmpeg"), "-hide_banner", "-y" if overwrite else "-n", *inputs,
         "-filter_complex", filter_complex, "-map", "[outa]", "-ar", str(project.sample_rate),
-        "-ac", str(project.channels), *audio_args_for(str(output)), str(output),
+        "-ac", str(project.channels), *audio_args_for(str(output), quality), str(output),
     ]
     return command, filter_complex, total
 

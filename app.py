@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import argparse
 import array
-import ctypes
 import json
 import math
-import os
 import queue
 import subprocess
 import sys
@@ -15,7 +13,7 @@ import time
 import uuid
 from pathlib import Path
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, font as tkfont, messagebox, ttk
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
 import audio_engine as audio
@@ -23,7 +21,7 @@ from audio_engine import AudioClip
 
 
 APP_NAME = "Audio Atelier"
-APP_VERSION = "v1.5.0"
+APP_VERSION = "v1.6.0"
 AUTO_FADE_SECONDS = audio.AUTO_FADE_SECONDS
 MIX_LIMITER_CEILING = audio.MIX_LIMITER_CEILING
 BG = "#17191f"
@@ -36,6 +34,7 @@ ACCENT_2 = "#63d8c6"
 WARNING = "#ffb454"
 CLIP_COLORS = ["#3778c2", "#9472c9", "#c0628c", "#458f79", "#b27843", "#6676c8"]
 MIN_TRIM_PREVIEW_SECONDS = 0.300
+RULER_DRAG_PIXELS = 6  # Ignore small click jitter before starting a scrub.
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v", ".wmv", ".mpeg", ".mpg"}
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg", ".wma", ".opus"}
 MEDIA_EXTENSIONS = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
@@ -87,7 +86,39 @@ def probe_duration(path: str) -> float:
     return audio.probe_duration(path)
 
 
-def waveform_points(path: str, count: int = 1400) -> list[float]:
+class WaveformPeaks:
+    """Keep the original envelope detail; coarser levels bound redraw cost."""
+    GROUP = 8
+
+    def __init__(self, samples, rate):
+        self.rate = rate
+        self.levels = [samples]
+        while len(samples) > 1024:
+            peaks = array.array("f")
+            for i in range(0, len(samples), self.GROUP):
+                block = samples[i:i + self.GROUP]
+                peaks.append(max(max(block), -min(block)))
+            self.levels.append(peaks)
+            samples = peaks
+        self.peak = max(max(samples, default=0), -min(samples, default=0)) or 1
+
+    def pixels(self, start, span, width):
+        step = span * self.rate / width
+        offset = start * self.rate
+        level = 0
+        while step >= self.GROUP and level + 1 < len(self.levels):
+            step /= self.GROUP
+            offset /= self.GROUP
+            level += 1
+        samples = self.levels[level]
+        for px in range(width):
+            first = int(offset + px * step)
+            last = max(first + 1, int(offset + (px + 1) * step))
+            block = samples[first:last]
+            yield max(max(block), -min(block)) / self.peak if block else 0.0
+
+
+def waveform_points(path: str) -> WaveformPeaks:
     proc = subprocess.run(
         [FFMPEG, "-v", "error", "-i", path, "-vn", "-ac", "1", "-ar", "2000", "-f", "s16le", "-"],
         capture_output=True,
@@ -99,15 +130,7 @@ def waveform_points(path: str, count: int = 1400) -> list[float]:
     samples.frombytes(proc.stdout)
     if sys.byteorder != "little":
         samples.byteswap()
-    if not samples:
-        return [0.0] * count
-    bucket = max(1, math.ceil(len(samples) / count))
-    points: list[float] = []
-    for i in range(0, len(samples), bucket):
-        part = samples[i : i + bucket]
-        points.append(max(abs(x) for x in part) / 32768.0)
-    peak = max(points) or 1.0
-    return [min(1.0, p / peak) for p in points]
+    return WaveformPeaks(samples, 2000)
 
 
 def format_time(seconds: float) -> str:
@@ -140,8 +163,57 @@ def supported_media_paths(paths) -> list[str]:
     return accepted
 
 
-def audio_args_for(path: str) -> list[str]:
-    return audio.audio_args_for(path)
+STANDARD_QUALITY = "標準（おすすめ）"
+QUALITY_PRESETS = {"軽量": "small", STANDARD_QUALITY: "standard", "高音質": "high"}
+
+
+class ExportActions(ttk.Frame):
+    def __init__(self, parent, button_text, command):
+        super().__init__(parent)
+        self.columnconfigure(0, weight=1)
+        self.transport = ttk.Frame(self)
+        self.transport.grid(row=0, column=0, sticky="w")
+        self.output = ttk.Frame(self)
+        self.output.grid(row=0, column=1, sticky="e")
+        self.quality = tk.StringVar(self, value=STANDARD_QUALITY)
+        ttk.Label(self.output, text="圧縮品質").pack(side="left")
+        ttk.Combobox(self.output, textvariable=self.quality, values=tuple(QUALITY_PRESETS), state="readonly",
+                     width=15).pack(side="left", padx=(4, 6))
+        ttk.Button(self.output, text=button_text, command=command, style="Accent.TButton").pack(side="left")
+        self.wrapped = False
+        self.bind("<Configure>", self._layout)
+
+    def _layout(self, event):
+        wrap = event.width < self.transport.winfo_reqwidth() + self.output.winfo_reqwidth()
+        if wrap != self.wrapped:
+            self.wrapped = wrap
+            self.output.grid(row=int(wrap), column=0 if wrap else 1, sticky="e", pady=(4 if wrap else 0, 0))
+
+
+def choose_audio_output(parent, title: str, stem: str, last_type: tk.StringVar) -> str | None:
+    initial = last_type.get()
+    selected = tk.StringVar(parent, value=initial)
+    raw = filedialog.asksaveasfilename(
+        parent=parent, title=title, initialfile=stem, typevariable=selected,
+        filetypes=[(fmt.upper(), f"*.{fmt}") for fmt in audio.OUTPUT_ENCODERS],
+    )
+    if not raw:
+        return None
+    label = selected.get()
+    chosen = label.lower()
+    path = Path(raw)
+    suffix = path.suffix[1:].lower()
+    if suffix not in audio.OUTPUT_ENCODERS:
+        path = Path(f"{raw}.{chosen}")
+    elif label != initial and chosen != suffix:
+        path = path.with_suffix(f".{chosen}")
+    # The native overwrite prompt only covers the exact path it returned.
+    if path != Path(raw) and path.exists() and not messagebox.askyesno(
+        APP_NAME, f"「{path.name}」は既にあります。上書きしますか？", parent=parent
+    ):
+        return None
+    last_type.set(path.suffix[1:].upper())
+    return str(path)
 
 
 def boundary_fade_filter(duration: float) -> str:
@@ -180,23 +252,39 @@ class BackgroundJobs:
 
 
 class WaveformCanvas(tk.Canvas):
+    RULER_HEIGHT = 48
+    GRIP_HEIGHT = 24
+    SIDE_PAD = 21
+    MIN_VIEW_SECONDS = 0.05
+
     def __init__(self, parent, on_range_change, **kwargs):
         super().__init__(parent, bg="#111319", highlightthickness=1, highlightbackground="#383d48", **kwargs)
         self.on_range_change = on_range_change
-        self.points: list[float] = []
+        self.points = None
         self.duration = 0.0
+        self.view_start = self.view_span = 0.0
         self.start = 0.0
         self.end = 0.0
-        self.playhead: float | None = None
+        self.playhead = 0.0
+        self.seek = Playhead(parent, self.set_playhead)
         self.dragging: str | None = None
+        self.press_x = self.grip_x = 0.0
+        self.pan_origin = 0.0
+        self.moved = False
+        self.ruler_click = False
         self.bind("<Configure>", lambda _e: self.redraw())
         self.bind("<Button-1>", self._press)
         self.bind("<B1-Motion>", self._motion)
-        self.bind("<ButtonRelease-1>", lambda _e: setattr(self, "dragging", None))
+        self.bind("<ButtonRelease-1>", self._release)
+        self.bind("<Motion>", self._hover)
+        self.bind("<MouseWheel>", self._wheel)
 
-    def set_data(self, points: list[float], duration: float) -> None:
-        self.points = points
+    def set_data(self, points, duration: float) -> None:
+        self.points = points if isinstance(points, WaveformPeaks) else WaveformPeaks(points, len(points) / duration if duration else 0)
         self.duration = duration
+        self.view_start, self.view_span = 0.0, duration
+        self.dragging = None
+        self.moved = self.ruler_click = self.seek.dragging = False
         self.start = 0.0
         self.end = duration
         self.redraw()
@@ -210,72 +298,249 @@ class WaveformCanvas(tk.Canvas):
         if notify:
             self.on_range_change(self.start, self.end)
 
-    def set_playhead(self, seconds: float | None) -> None:
+    def set_playhead(self, seconds: float) -> None:
         self.playhead = seconds
         self.delete("playhead")
         self._draw_playhead()
 
     def _draw_playhead(self) -> None:
-        if self.playhead is None or self.duration <= 0:
+        if self.playhead < self.view_start or self.playhead > self._view_end:
             return
         x = self._x_for(self.playhead)
         h = self.winfo_height()
-        self.create_line(x, 0, x, h, fill="#ff4f67", width=3, tags="playhead")
-        self.create_polygon(x - 7, 0, x + 7, 0, x, 11, fill="#ff4f67", outline="", tags="playhead")
-        self.tag_raise("playhead")
+        self.create_line(x, 15, x, max(17, h - self.GRIP_HEIGHT), fill="#ff4f67", width=2, tags="playhead")
+        self.create_polygon(x - 8, 3, x + 8, 3, x, 17, fill="#ff4f67", outline="", tags="playhead")
+        right = x > self.winfo_width() - 100
+        self.create_text(x + (-10 if right else 10), 10, anchor="e" if right else "w",
+                         text=format_time(self.playhead), fill="#ff8798", tags="playhead")
+        self.tag_raise("trim_grip")
+
+    @property
+    def _view_end(self) -> float:
+        # Panning clamps start to duration - span. Adding span back need not
+        # reproduce duration exactly, especially at high zoom.
+        if self.view_start >= self.duration - self.view_span:
+            return self.duration
+        return self.view_start + self.view_span
 
     def _x_for(self, seconds: float) -> float:
-        return 12 + (max(0.0, seconds) / max(self.duration, 0.001)) * max(1, self.winfo_width() - 24)
+        width_seconds = self._view_end - self.view_start
+        fraction = (seconds - self.view_start) / width_seconds if width_seconds > 0 else 0
+        return self.SIDE_PAD + fraction * max(1, self.winfo_width() - 2 * self.SIDE_PAD)
 
     def _time_for(self, x: float) -> float:
-        usable = max(1, self.winfo_width() - 24)
-        return max(0.0, min(self.duration, ((x - 12) / usable) * self.duration))
+        usable = max(1, self.winfo_width() - 2 * self.SIDE_PAD)
+        fraction = max(0.0, min(1.0, (x - self.SIDE_PAD) / usable))
+        end = self._view_end
+        return end if fraction == 1 else self.view_start + fraction * (end - self.view_start)
+
+    def _wheel(self, event):
+        if self.duration <= 0 or self.dragging or self.ruler_click or not event.delta:
+            return "break"
+        anchor = self._time_for(event.x)
+        fraction = (anchor - self.view_start) / self.view_span
+        steps = max(-32, min(32, event.delta / 120))
+        span = min(self.duration, max(self.MIN_VIEW_SECONDS, self.view_span * 1.5 ** -steps))
+        if abs(span - self.duration) < 1e-9:
+            span = self.duration
+        if span != self.view_span:
+            self.view_start = max(0.0, min(self.duration - span, anchor - fraction * span))
+            self.view_span = span
+            self.redraw()
+        return "break"
+
+    def _pan_metrics(self):
+        track = max(1, self.winfo_width() - 2 * self.SIDE_PAD)
+        thumb = min(track, max(18, track * self.view_span / self.duration))
+        return thumb, max(1, track - thumb)
+
+    def _target(self, event):
+        if self.duration <= 0:
+            return None
+        sx, ex, px = map(self._x_for, (self.start, self.end, self.playhead))
+        left, right = self.SIDE_PAD, self.winfo_width() - self.SIDE_PAD
+        in_ruler = self._in_ruler(event)
+        head_hit = left <= px <= right and abs(event.x - px) <= (9 if in_ruler else 7)
+        # Separate hit areas even when the playhead and both boundaries coincide.
+        if in_ruler:
+            return "playhead" if head_hit else None
+        if event.y >= self.winfo_height() - self.GRIP_HEIGHT:
+            if left <= sx <= right and sx - 20 <= event.x <= sx:
+                return "start"
+            if left <= ex <= right and ex <= event.x <= ex + 20:
+                return "end"
+        elif head_hit:
+            return "playhead"
+        distance, target = min(((abs(event.x - x), handle) for x, handle in ((sx, "start"), (ex, "end"))
+                                if left <= x <= right), default=(math.inf, None))
+        if distance <= 6:
+            return target
+        if event.y >= self.winfo_height() - self.GRIP_HEIGHT and self.view_span < self.duration:
+            return "pan"
+        return None
+
+    def _in_ruler(self, event):
+        return self.duration > 0 and 0 <= event.y <= self.RULER_HEIGHT
+
+    def _hover(self, event):
+        target = self._target(event)
+        self.configure(cursor="hand2" if target == "pan" else "sb_h_double_arrow" if target
+                       else "hand2" if self._in_ruler(event) else "")
 
     def _press(self, event) -> None:
-        if not self.points:
-            return
-        sx, ex = self._x_for(self.start), self._x_for(self.end)
-        if abs(event.x - sx) <= abs(event.x - ex):
-            self.dragging = "start"
-        else:
-            self.dragging = "end"
-        self._motion(event)
+        self.dragging = self._target(event)
+        self.moved = False
+        self.press_x = event.x
+        self.ruler_click = self._in_ruler(event)
+        if self.dragging == "pan":
+            self.pan_origin = self.view_start
+        elif self.dragging:
+            self.grip_x = self._x_for(getattr(self, self.dragging))
+        if self.ruler_click:
+            # Latch the press, even if the pointer drifts outside the ruler
+            # before release. Playback ticks must not overwrite this position.
+            self.dragging = "playhead"
+            self.grip_x = self.press_x
+            self.seek.dragging = True
+            self.seek.show(self._time_for(self.press_x))
 
     def _motion(self, event) -> None:
-        value = self._time_for(event.x)
+        threshold = RULER_DRAG_PIXELS if self.ruler_click else 3
+        if not self.dragging or (not self.moved and abs(event.x - self.press_x) < threshold):
+            return
+        self.moved = True
+        if self.dragging == "pan":
+            limit = self.duration - self.view_span
+            _, travel = self._pan_metrics()
+            start = max(0.0, min(limit, self.pan_origin + (event.x - self.press_x) * limit / travel))
+            if start != self.view_start:
+                self.view_start = start
+                self.redraw()
+            return
+        value = self._time_for(self.grip_x + event.x - self.press_x)
+        if self.dragging == "playhead":
+            self.seek.dragging = True
+            self.seek.show(value)
+            return
+        previous = self.start, self.end
         minimum = min(0.05, self.duration)
         if self.dragging == "start":
             self.start = max(0.0, min(value, self.end - minimum))
         elif self.dragging == "end":
             self.end = min(self.duration, max(value, self.start + minimum))
-        self.redraw()
-        self.on_range_change(self.start, self.end)
+        if previous != (self.start, self.end):
+            self.redraw()
+            self.on_range_change(self.start, self.end)
+
+    def _release(self, event):
+        if self.moved or self.ruler_click:
+            self._motion(event)
+        if self.ruler_click or (self.moved and self.dragging == "playhead"):
+            self.seek.finish_drag()
+        self.dragging = None
+        self.moved = False
+        self.ruler_click = False
+
+    def _draw_ruler(self, width):
+        bottom = self.RULER_HEIGHT
+        self.create_rectangle(0, 0, width, bottom, fill="#1b1e26", outline="")
+        self.create_line(0, bottom, width, bottom, fill="#474e5b")
+        if self.duration <= 0:
+            return
+        # Choose a readable 1/2/5 interval based on seconds per screen pixel.
+        target = self.view_span / max(1, (width - 2 * self.SIDE_PAD) // 88)
+        unit = 10 ** math.floor(math.log10(target))
+        major = next(factor * unit for factor in (1, 2, 5, 10) if factor * unit >= target)
+        decimals = max(0, -math.floor(math.log10(major)))
+        minor = major / 5
+        first = math.ceil(self.view_start / minor - 1e-9)
+        last = math.floor(self._view_end / minor + 1e-9)
+        for i in range(first, last + 1):
+            seconds = i * minor
+            x = self._x_for(seconds)
+            labelled = i % 5 == 0
+            self.create_line(x, bottom - (9 if labelled else 4), x, bottom, fill=MUTED)
+            if labelled:
+                right = x > width - 48
+                self.create_text(x + (-2 if right else 2), bottom - 12,
+                                 anchor="se" if right else "sw", text=f"{seconds:.{decimals}f}s",
+                                 fill=MUTED, font=("Segoe UI", 9), tags="ruler_label")
 
     def redraw(self) -> None:
         self.delete("all")
         w, h = self.winfo_width(), self.winfo_height()
-        if w <= 24 or h <= 20:
+        if w <= 2 * self.SIDE_PAD or h <= self.RULER_HEIGHT + self.GRIP_HEIGHT:
             return
-        mid = h / 2
-        self.create_line(12, mid, w - 12, mid, fill="#3a404d")
+        top = self.RULER_HEIGHT
+        self._draw_ruler(w)
+        bottom = h - self.GRIP_HEIGHT
+        mid = (bottom + top) / 2
+        self.create_rectangle(0, bottom, w, h, fill=BG, outline="")
+        self.create_line(0, bottom, w, bottom, fill="#474e5b")
+        if 0 < self.view_span < self.duration:
+            thumb, travel = self._pan_metrics()
+            x = self.SIDE_PAD + travel * self.view_start / (self.duration - self.view_span)
+            y = bottom + self.GRIP_HEIGHT / 2
+            self.create_line(self.SIDE_PAD, y, w - self.SIDE_PAD, y, fill="#3a404d", width=3)
+            self.create_rectangle(x, y - 3, x + thumb, y + 3, fill=MUTED, outline="", tags="pan_thumb")
+        self.create_line(self.SIDE_PAD, mid, w - self.SIDE_PAD, mid, fill="#3a404d")
         if not self.points:
             self.create_text(w / 2, mid, text="動画または音声ファイルを読み込んでください", fill=MUTED)
+            self._draw_playhead()
             return
-        usable = w - 24
-        step = max(1, len(self.points) / usable)
-        for px in range(int(usable)):
-            idx = min(len(self.points) - 1, int(px * step))
-            amp = self.points[idx] * (h * 0.39)
-            self.create_line(12 + px, mid - amp, 12 + px, mid + amp, fill=ACCENT_2)
+        usable = w - 2 * self.SIDE_PAD
+        for px, peak in enumerate(self.points.pixels(self.view_start, self.view_span, usable)):
+            amp = peak * ((bottom - top) * 0.39)
+            self.create_line(self.SIDE_PAD + px, mid - amp, self.SIDE_PAD + px, mid + amp, fill=ACCENT_2)
         sx, ex = self._x_for(self.start), self._x_for(self.end)
-        self.create_rectangle(0, 0, sx, h, fill="#232630", outline="")
-        self.create_rectangle(ex, 0, w, h, fill="#232630", outline="")
-        for x, color in ((sx, ACCENT), (ex, WARNING)):
-            self.create_line(x, 0, x, h, fill=color, width=3)
-            self.create_polygon(x - 7, 0, x + 7, 0, x, 10, fill=color, outline="")
-        self.create_text(16, 14, anchor="w", text=format_time(self.start), fill=TEXT)
-        self.create_text(w - 16, 14, anchor="e", text=format_time(self.end), fill=TEXT)
+        self.create_rectangle(0, top + 1, max(0, min(w, sx)), bottom, fill="#232630", outline="")
+        self.create_rectangle(max(0, min(w, ex)), top + 1, w, bottom, fill="#232630", outline="")
+        for x, direction, color in ((sx, -1, ACCENT), (ex, 1, WARNING)):
+            if not self.SIDE_PAD <= x <= w - self.SIDE_PAD:
+                continue
+            self.create_line(x, top, x, bottom, fill=color, width=3)
+            self.create_polygon(x, bottom - 3, x + direction * 18, bottom + 9,
+                                x + direction * 18, h - 3, x, h - 3,
+                                fill=color, outline="", tags="trim_grip")
+        self.create_text(16, bottom - 12, anchor="w", text=format_time(self.start), fill=TEXT)
+        self.create_text(w - 16, bottom - 12, anchor="e", text=format_time(self.end), fill=TEXT)
         self._draw_playhead()
+
+
+class Playhead:
+    def __init__(self, tab, draw_playhead):
+        self.tab = tab
+        self.draw_playhead = draw_playhead
+        self.start = self.end = 0.0
+        self.dragging = False
+        self.looping = False
+        self.position = 0.0
+
+    def bounds(self, start, end):
+        if (self.start, self.end) != (start, end):
+            self.start, self.end = start, end
+            position = self.position
+            self.show(position if start <= position <= end else start)
+
+    def show(self, position):
+        value = max(self.start, min(position, self.end))
+        self.position = value
+        self.draw_playhead(value)
+
+    def finish_drag(self):
+        self.dragging = False
+        self.tab.app.seek(self)
+
+
+def loop_preview_graph(preview_file: Path, offset: float) -> str:
+    # Only app-generated ASCII basenames are passed to lavfi. Use cwd for the
+    # directory so spaces, drive letters and special chars never enter the graph.
+    source = f"amovie=filename={preview_file.name}"
+    repeat = f"{source}:loop=0,asetpts=N/SR/TB"
+    if offset <= 0:
+        return repeat
+    return (f"{source}:sp={offset:.9f},asetpts=N/SR/TB[tail];"
+            f"{repeat}[cycles];[tail][cycles]concat=n=2:v=0:a=1")
 
 
 class TrimTab(ttk.Frame):
@@ -289,8 +554,7 @@ class TrimTab(ttk.Frame):
         self.fade_in_var = tk.StringVar(value=f"{AUTO_FADE_SECONDS:.3f}")
         self.fade_out_var = tk.StringVar(value=f"{AUTO_FADE_SECONDS:.3f}")
         self.status = tk.StringVar(value="動画または音声を選択するか、画面へドラッグ＆ドロップしてください")
-        self.format_var = tk.StringVar(value="wav")
-        self.preview_serial = 0
+        self.last_export_type = tk.StringVar(value="WAV")
         self._build()
 
     def _build(self) -> None:
@@ -300,7 +564,7 @@ class TrimTab(ttk.Frame):
         self.file_label = ttk.Label(top, text="未選択（画面へドラッグ＆ドロップ可）", foreground=MUTED)
         self.file_label.pack(side="left", padx=12, fill="x", expand=True)
 
-        ttk.Label(self, text="波形の左右ハンドルをドラッグして、切り出す範囲を指定します。", foreground=MUTED).pack(anchor="w", pady=(18, 7))
+        ttk.Label(self, text="ホイールで拡大・縮小。下のバーで表示を移動、青・オレンジで範囲を調整。上の目盛りで再生位置を指定します。", foreground=MUTED).pack(anchor="w", pady=(18, 7))
         self.wave = WaveformCanvas(self, self._range_changed, height=260)
         self.wave.pack(fill="both", expand=True)
 
@@ -313,8 +577,6 @@ class TrimTab(ttk.Frame):
         end_entry = ttk.Entry(controls, textvariable=self.end_var, width=11)
         end_entry.pack(side="left", padx=(7, 18))
         ttk.Button(controls, text="数値を反映", command=self.apply_entries).pack(side="left")
-        ttk.Label(controls, text="出力形式").pack(side="left", padx=(28, 7))
-        ttk.Combobox(controls, textvariable=self.format_var, values=("wav", "mp3", "m4a"), state="readonly", width=7).pack(side="left")
 
         fades = ttk.Frame(self)
         fades.pack(fill="x", pady=(0, 14))
@@ -324,11 +586,15 @@ class TrimTab(ttk.Frame):
         ttk.Entry(fades, textvariable=self.fade_out_var, width=9).pack(side="left", padx=(7, 14))
         ttk.Label(fades, text="0で無効。初期値の0.010秒は境界ノイズを抑える設定です。", foreground=MUTED).pack(side="left")
 
-        actions = ttk.Frame(self)
-        actions.pack(fill="x")
-        ttk.Button(actions, text="▶ 選択範囲を試聴", command=self.preview).pack(side="left")
+        self.seek = self.wave.seek
+        bar = ExportActions(self, "選択範囲を書き出す", self.export)
+        bar.pack(fill="x")
+        actions, self.export_quality = bar.transport, bar.quality
+        ttk.Button(actions, text="▶ 切り出し範囲を視聴", command=self.preview).pack(side="left")
+        ttk.Button(actions, text="↻ ループ再生", command=lambda: self.preview(True)).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="繋ぎ目を確認", command=lambda: self.preview(True, seam=True)).pack(side="left", padx=(4, 0))
+        ttk.Button(actions, text="一時停止", command=lambda: self.app.pause_preview(self.seek)).pack(side="left", padx=(4, 0))
         ttk.Button(actions, text="■ 停止", command=self.stop_preview).pack(side="left", padx=8)
-        ttk.Button(actions, text="選択範囲を書き出す", command=self.export, style="Accent.TButton").pack(side="right")
         ttk.Label(self, textvariable=self.status, foreground=MUTED).pack(anchor="w", pady=(12, 0))
 
     def choose_file(self) -> None:
@@ -346,7 +612,6 @@ class TrimTab(ttk.Frame):
         self.load_file(path)
 
     def load_file(self, path: str) -> None:
-        self.preview_serial += 1
         self.app.stop_playback()
         self.path = path
         self.file_label.configure(text=Path(path).name)
@@ -362,6 +627,7 @@ class TrimTab(ttk.Frame):
         self.duration, points = result
         self.wave.set_data(points, self.duration)
         self._range_changed(0.0, self.duration)
+        self.seek.show(0.0)
         self.status.set(f"読み込み完了　全体 {format_time(self.duration)}")
 
     def _load_failed(self, exc: Exception) -> None:
@@ -369,8 +635,9 @@ class TrimTab(ttk.Frame):
         messagebox.showerror(APP_NAME, str(exc))
 
     def _range_changed(self, start: float, end: float) -> None:
-        self.preview_serial += 1
-        self.app.stop_playback()
+        if self.app.active_bar is self.seek:
+            self.app.stop_playback()
+        self.seek.bounds(start, end)
         self.start_var.set(f"{start:.3f}")
         self.end_var.set(f"{end:.3f}")
         if self.duration:
@@ -379,9 +646,10 @@ class TrimTab(ttk.Frame):
     def apply_entries(self) -> bool:
         try:
             start, end = float(self.start_var.get()), float(self.end_var.get())
-            if start < 0 or end <= start or end > self.duration + 0.001:
+            if not (0 <= start < end <= self.duration + 0.001) or start >= self.duration:
                 raise ValueError
-            self.wave.set_range(start, end, notify=True)
+            if (start, end) != (round(self.wave.start, 3), round(self.wave.end, 3)):
+                self.wave.set_range(start, end, notify=True)
             return True
         except ValueError:
             messagebox.showwarning(APP_NAME, "開始・終了秒を正しく入力してください。")
@@ -399,11 +667,11 @@ class TrimTab(ttk.Frame):
             return None
 
     def stop_preview(self) -> None:
-        self.preview_serial += 1
         self.app.stop_playback()
+        self.seek.show(self.seek.start)
         self.status.set("試聴を停止しました")
 
-    def preview(self) -> None:
+    def preview(self, loop=False, *, seam=False) -> None:
         if not self.path or self.duration <= 0:
             messagebox.showinfo(APP_NAME, "先にファイルを読み込んでください。")
             return
@@ -412,54 +680,50 @@ class TrimTab(ttk.Frame):
         fade_values = self.fade_values()
         if fade_values is None:
             return
-        start, end = float(self.start_var.get()), float(self.end_var.get())
+        start, end = self.wave.start, self.wave.end
         fade_in, fade_out = fade_values
         duration = end - start
         source = self.path
         out = str(TEMP_DIR / f"trim_preview_{uuid.uuid4().hex}.wav")
-        self.preview_serial += 1
-        serial = self.preview_serial
+        restart = self.seek.looping
         self.app.stop_playback()
+        self.app.active_bar = self.seek
+        self.seek.looping = loop
+        if seam:
+            self.seek.show(max(start, end - 3.0))
+        elif restart or self.seek.position >= end:
+            self.seek.show(start)
+        request = self.app.playback_serial
         self.status.set("選択範囲を正確に切り出しています…")
 
         def work():
             playback_duration = max(duration, MIN_TRIM_PREVIEW_SECONDS)
             preview_filter = trim_filter_with_fades(start, end, fade_in, fade_out)
-            if playback_duration > duration:
+            if not loop and playback_duration > duration:
                 preview_filter += f",apad=pad_dur={playback_duration-duration:.6f}"
             run_ffmpeg([
                 "-i", source, "-map", "0:a:0", "-vn",
                 "-af", preview_filter,
                 "-c:a", "pcm_s16le", out,
             ])
-            return serial, out, start, duration, playback_duration
+            return request, out, loop
 
         def failed(exc: Exception) -> None:
             Path(out).unlink(missing_ok=True)
-            if serial == self.preview_serial:
+            if request == self.app.playback_serial:
+                self.app.stop_playback()
                 self.status.set("試聴の準備に失敗しました")
                 messagebox.showerror(APP_NAME, str(exc))
 
         self.app.jobs.submit(work, self._preview_ready, failed)
 
     def _preview_ready(self, result) -> None:
-        serial, path, start, duration, playback_duration = result
-        if serial != self.preview_serial:
+        request, path, loop = result
+        if request != self.app.playback_serial:
             Path(path).unlink(missing_ok=True)
             return
 
-        def update_playhead(position: float | None) -> None:
-            self.wave.set_playhead(None if position is None else start + min(position, duration))
-            if position is None and serial == self.preview_serial:
-                self.status.set(f"試聴終了　選択範囲 {duration:.3f} 秒")
-
-        self.status.set(f"選択範囲を再生しています（{duration:.3f} 秒）")
-        self.app.play(
-            path,
-            duration=playback_duration,
-            progress_callback=update_playhead,
-            cleanup_path=path,
-        )
+        self.app.play(path, self.seek, loop)
 
     def export(self) -> None:
         if not self.path or self.duration <= 0:
@@ -470,12 +734,11 @@ class TrimTab(ttk.Frame):
         fade_values = self.fade_values()
         if fade_values is None:
             return
-        fmt = self.format_var.get()
-        suggested = f"{Path(self.path).stem}_trim.{fmt}"
-        out = filedialog.asksaveasfilename(title="音声を書き出す", defaultextension=f".{fmt}", initialfile=suggested, filetypes=[(fmt.upper(), f"*.{fmt}")])
+        out = choose_audio_output(self, "音声を書き出す", f"{Path(self.path).stem}_trim", self.last_export_type)
         if not out:
             return
-        start, end = float(self.start_var.get()), float(self.end_var.get())
+        quality = QUALITY_PRESETS[self.export_quality.get()]
+        start, end = self.wave.start, self.wave.end
         fade_in, fade_out = fade_values
         self.status.set("音声を書き出しています…")
 
@@ -483,7 +746,7 @@ class TrimTab(ttk.Frame):
             run_ffmpeg([
                 "-i", self.path, "-map", "0:a:0", "-vn",
                 "-af", trim_filter_with_fades(start, end, fade_in, fade_out),
-                *audio_args_for(out), out,
+                *audio.audio_args_for(out, quality), out,
             ])
             return out
 
@@ -498,11 +761,36 @@ class TrimTab(ttk.Frame):
         messagebox.showerror(APP_NAME, str(exc))
 
 
+def free_clip_start(clips, moving, lane, requested, snap=0.0):
+    """Project the requested start onto the nearest gap which fits the whole clip."""
+    requested = max(0.0, requested)
+    occupied = sorted((c.start, math.inf if c.loop else c.start + c.duration)
+                      for c in clips if c is not moving and c.lane == lane)
+    candidates = []
+    left = 0.0
+    for begin, end in occupied:
+        right = begin - moving.duration
+        if not moving.loop and right >= left - 1e-9:
+            candidates.append((left, max(left, right)))
+        left = max(left, end)
+    if math.isfinite(left):
+        candidates.append((left, math.inf))
+    if not candidates:
+        return None
+    def closest(bounds):
+        lo, hi = bounds
+        return min(hi, max(lo, requested))
+    bounds = min(candidates, key=lambda b: (abs(closest(b) - requested), abs(closest(b) - moving.start)))
+    start = closest(bounds)
+    edge = min(bounds, key=lambda t: abs(t - start))
+    return edge if abs(edge - start) <= snap else start
+
+
 class TimelineCanvas(tk.Canvas):
     TOP = 34
     LANE_H = 66
 
-    def __init__(self, parent, on_select, on_move, **kwargs):
+    def __init__(self, parent, tab, on_select, on_move, **kwargs):
         super().__init__(parent, bg="#111319", highlightthickness=1, highlightbackground="#383d48", **kwargs)
         self.on_select = on_select
         self.on_move = on_move
@@ -511,16 +799,63 @@ class TimelineCanvas(tk.Canvas):
         self.pixels_per_second = 30.0
         self.drag_clip: AudioClip | None = None
         self.drag_offset_x = 0.0
-        self.playhead: float | None = None
+        self.playhead = 0.0
+        self.seek = Playhead(tab, self.set_playhead)
+        self.seek_grab = None
+        self._seek_moved = False
         self.timeline_width = 1.0
+        self.hold_zoom_view = False
+        self.label_font = tkfont.nametofont("TkDefaultFont")
         self.bind("<Button-1>", self._press)
         self.bind("<B1-Motion>", self._motion)
         self.bind("<ButtonRelease-1>", self._release)
         self.bind("<Configure>", lambda _e: self.redraw())
+        self.bind("<MouseWheel>", self._wheel)
 
-    def set_zoom(self, value: float) -> None:
-        self.pixels_per_second = float(value)
+    def _extent(self):
+        return max([c.start + c.duration for c in self.clips] + [60.0, self.seek.tab.project_duration or 0])
+
+    def _time_at(self, screen_x):
+        return (self.canvasx(screen_x) - 70) / self.pixels_per_second
+
+    def _wheel(self, event):
+        if not event.delta or self.drag_clip is not None or self.seek_grab is not None:
+            return "break"
+        anchor = self._time_at(event.x)
+        plot_width = max(1, self.winfo_width() - 120)
+        extent = self._extent()
+        fit = plot_width / extent
+        # Keep Tk's pixel coordinates representable even for very long projects.
+        maximum = max(fit, min(plot_width / WaveformCanvas.MIN_VIEW_SECONDS, 1e8 / extent))
+        factor = 1.5 ** max(-32, min(32, event.delta / 120))
+        scale = max(fit, min(maximum, self.pixels_per_second * factor))
+        if scale == self.pixels_per_second:
+            return "break"
+        self.pixels_per_second = scale
         self.redraw()
+        left = 70 + anchor * scale - event.x
+        self.xview_moveto((left + self.winfo_pixels(self.cget("highlightthickness"))) / self.timeline_width)
+        self.hold_zoom_view = self.seek.tab.app.active_bar is self.seek
+        return "break"
+
+    def draw_ticks(self):
+        # Only draw the visible ruler; zooming should not allocate one item
+        # per tick for the entire project. Called on horizontal scrolling too.
+        self.delete("ruler_tick")
+        pps = self.pixels_per_second
+        target = 76 / pps
+        unit = 10 ** math.floor(math.log10(target))
+        step = next(k * unit for k in (1, 2, 5, 10) if k * unit >= target)
+        first = max(0, math.floor(self._time_at(0) / step))
+        last = math.ceil(min(self._extent(), self._time_at(self.winfo_width())) / step)
+        digits = max(0, -math.floor(math.log10(step)))
+        for index in range(first, last + 1):
+            t = index * step
+            x = 70 + t * pps
+            self.create_line(x, 18, x, self.TOP, fill="#2c303a", tags="ruler_tick")
+            self.create_text(x + 3, 8, anchor="nw", text=f"{t:.{digits}f}s", fill=MUTED,
+                             font=("Segoe UI", 8), tags="ruler_tick")
+        self.tag_raise("playhead")
 
     def set_clips(self, clips: list[AudioClip]) -> None:
         self.clips = clips
@@ -528,15 +863,20 @@ class TimelineCanvas(tk.Canvas):
             self.selected = None
         self.redraw()
 
-    def set_playhead(self, seconds: float | None) -> None:
+    def set_playhead(self, seconds: float) -> None:
         self.playhead = seconds
         self.delete("playhead")
         self._draw_playhead()
-        if seconds is None:
+        if self.seek.dragging:
             return
         x = 70 + seconds * self.pixels_per_second
         left = self.canvasx(0)
         right = self.canvasx(self.winfo_width())
+        if self.hold_zoom_view and self.seek.tab.app.active_bar is self.seek:
+            # A playback tick must not immediately scroll away from the zoom anchor.
+            if not left + 30 <= x <= right - 50:
+                return
+        self.hold_zoom_view = False
         if x < left + 30 or x > right - 50:
             target = max(0.0, x - self.winfo_width() * 0.3)
             self.xview_moveto(min(1.0, target / max(1.0, self.timeline_width)))
@@ -553,24 +893,14 @@ class TimelineCanvas(tk.Canvas):
 
     def redraw(self) -> None:
         self.delete("all")
-        max_end = max([c.start + c.duration for c in self.clips] + [60.0])
+        max_end = self._extent()
         width = max(self.winfo_width(), 120 + max_end * self.pixels_per_second)
         self.timeline_width = width
         lanes = max([c.lane for c in self.clips] + [3]) + 1
         height = max(self.winfo_height(), self.TOP + lanes * self.LANE_H)
         self.configure(scrollregion=(0, 0, width, height))
 
-        interval = 1
-        if self.pixels_per_second < 15:
-            interval = 5
-        elif self.pixels_per_second > 70:
-            interval = 0.5
-        t = 0.0
-        while t <= max_end + 10:
-            x = 70 + t * self.pixels_per_second
-            self.create_line(x, 18, x, height, fill="#2c303a")
-            self.create_text(x + 3, 8, anchor="nw", text=f"{t:g}s", fill=MUTED, font=("Segoe UI", 8))
-            t += interval
+        self.draw_ticks()
         for lane in range(lanes):
             y = self.TOP + lane * self.LANE_H
             self.create_rectangle(0, y, width, y + self.LANE_H, fill="#161920" if lane % 2 == 0 else "#1a1d25", outline="")
@@ -579,7 +909,7 @@ class TimelineCanvas(tk.Canvas):
 
         for clip in self.clips:
             x1 = 70 + clip.start * self.pixels_per_second
-            x2 = x1 + max(8, clip.duration * self.pixels_per_second)
+            x2 = x1 + clip.duration * self.pixels_per_second
             y1 = self.TOP + clip.lane * self.LANE_H + 7
             y2 = y1 + self.LANE_H - 14
             outline = "#ffffff" if clip.id == self.selected else clip.color
@@ -592,22 +922,47 @@ class TimelineCanvas(tk.Canvas):
             if clip.gain_db:
                 flags += f"  音量{gain_db_to_percent(clip.gain_db):.0f}%"
             label = f"{clip.name}  {clip.duration:.2f}s{flags}"
-            self.create_text(x1 + 8, (y1 + y2) / 2, anchor="w", text=label, fill="white", tags=("clip", clip.id))
+            space = x2 - x1 - 12
+            if space > 0 and self.label_font.measure(label) > space:
+                lo, hi = 0, len(label)
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if self.label_font.measure(label[:mid] + "…") <= space:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                label = label[:lo] + "…" if lo else ""
+            if space > 0 and label:
+                self.create_text(x1 + 8, (y1 + y2) / 2, anchor="w", text=label, font=self.label_font, fill="white", tags=("clip", clip.id))
         self._draw_playhead()
+        self.event_generate("<<TimelineRedrawn>>", when="tail")
 
     def _clip_at(self, x: float, y: float) -> AudioClip | None:
+        nearby = None
         for clip in reversed(self.clips):
             x1 = 70 + clip.start * self.pixels_per_second
-            x2 = x1 + max(8, clip.duration * self.pixels_per_second)
+            x2 = x1 + clip.duration * self.pixels_per_second
             y1 = self.TOP + clip.lane * self.LANE_H + 7
             y2 = y1 + self.LANE_H - 14
-            if x1 <= x <= x2 and y1 <= y <= y2:
-                return clip
-        return None
+            if y1 <= y <= y2:
+                if x1 <= x < x2:
+                    return clip
+                if nearby is None and x1 <= x <= x1 + max(8, x2 - x1):
+                    nearby = clip
+        return nearby
 
     def _press(self, event) -> None:
         x, y = self.canvasx(event.x), self.canvasy(event.y)
+        if 0 <= y <= self.TOP and self.seek.end > 0:
+            self.seek_grab = (event.x, 0)
+            self.seek.dragging = True
+            self.seek.show(self._time_at(event.x))
+            return
         clip = self._clip_at(x, y)
+        head_x = 70 + self.playhead * self.pixels_per_second
+        if not clip and self.seek.end > 0 and abs(x - head_x) <= 8:
+            self.seek_grab = (event.x, head_x - x)
+            return
         if clip:
             self.selected = clip.id
             self.drag_clip = clip
@@ -616,16 +971,28 @@ class TimelineCanvas(tk.Canvas):
             self.redraw()
 
     def _motion(self, event) -> None:
+        if self.seek_grab is not None:
+            press_x, offset = self.seek_grab
+            if self._seek_moved or abs(event.x - press_x) >= RULER_DRAG_PIXELS:
+                self._seek_moved = True
+                self.seek.dragging = True
+                self.seek.show((self.canvasx(event.x) + offset - 70) / self.pixels_per_second)
+            return
         if not self.drag_clip:
             return
         x, y = self.canvasx(event.x), self.canvasy(event.y)
         raw_start = (x - self.drag_offset_x - 70) / self.pixels_per_second
-        self.drag_clip.start = max(0.0, round(raw_start * 10) / 10)
-        self.drag_clip.lane = max(0, min(15, int((y - self.TOP) // self.LANE_H)))
-        self.on_move(self.drag_clip)
+        lane = max(0, min(15, int((y - self.TOP) // self.LANE_H)))
+        self.on_move(self.drag_clip, round(raw_start * 10) / 10, lane,
+                     snap=min(.1, 4 / self.pixels_per_second))
         self.redraw()
 
-    def _release(self, _event) -> None:
+    def _release(self, event) -> None:
+        if self.seek.dragging:
+            self._motion(event)
+            self.seek.finish_drag()
+        self.seek_grab = None
+        self._seek_moved = False
         self.drag_clip = None
 
 
@@ -638,8 +1005,7 @@ class MixTab(ttk.Frame):
         self.gap_var = tk.StringVar(value="0.0")
         self.start_var = tk.StringVar(value="0.000")
         self.lane_var = tk.StringVar(value="1")
-        self.zoom_var = tk.DoubleVar(value=30)
-        self.format_var = tk.StringVar(value="wav")
+        self.last_export_type = tk.StringVar(value="WAV")
         self.status = tk.StringVar(value="音声・動画を追加するか、画面へドラッグ＆ドロップしてください")
         self.project_path: str | None = None
         self.project_duration: float | None = None
@@ -647,44 +1013,48 @@ class MixTab(ttk.Frame):
         self.channels = 2
         self.loudness_lufs: float | None = None
         self.true_peak_db = -1.0
-        self.preview_serial = 0
         self._build()
 
     def _build(self) -> None:
-        toolbar = ttk.Frame(self)
-        toolbar.pack(fill="x")
+        panel = ttk.Frame(self)
+        panel.pack(fill="x")
+        panel.columnconfigure(0, weight=1)
+        panel.rowconfigure(2, weight=1)
+        toolbar = ttk.Frame(panel)
+        toolbar.grid(row=0, column=0, sticky="ew")
         ttk.Button(toolbar, text="＋ 音声・動画を追加", command=self.add_files, style="Accent.TButton").pack(side="left")
         ttk.Button(toolbar, text="選択を削除", command=self.delete_selected).pack(side="left", padx=8)
         ttk.Button(toolbar, text="すべて消去", command=self.clear_all).pack(side="left")
         ttk.Button(toolbar, text="JSONを開く", command=self.open_project).pack(side="left", padx=(16, 8))
         ttk.Button(toolbar, text="JSON保存", command=self.save_project).pack(side="left")
-        ttk.Label(toolbar, text="ズーム").pack(side="right", padx=(14, 5))
-        ttk.Scale(toolbar, from_=5, to=100, variable=self.zoom_var, command=lambda v: self.timeline.set_zoom(float(v)), length=160).pack(side="right")
 
-        ttk.Label(self, text="音声・動画は画面へドロップしても追加できます。左右で開始時間、上下でレーンが変わります。", foreground=MUTED).pack(anchor="w", pady=(14, 7))
-        holder = ttk.Frame(self)
-        holder.pack(fill="x")
+        ttk.Label(panel, text="ホイールで拡大・縮小。上の目盛りをクリックし、そのままドラッグして再生位置を指定します。", foreground=MUTED).grid(row=1, column=0, sticky="w", pady=(14, 7))
+        holder = ttk.Frame(panel)
+        holder.grid(row=2, column=0, sticky="nsew")
         # 秒数目盛りと4レーンがちょうど収まる高さ。5レーン目以降は縦スクロールで表示する。
         timeline_height = TimelineCanvas.TOP + TimelineCanvas.LANE_H * 4 + 2
-        self.timeline = TimelineCanvas(holder, self.select_clip, self.clip_moved, height=timeline_height)
+        self.timeline = TimelineCanvas(holder, self, self.select_clip, self.clip_moved, height=timeline_height)
         xbar = ttk.Scrollbar(holder, orient="horizontal", command=self.timeline.xview)
         ybar = ttk.Scrollbar(holder, orient="vertical", command=self.timeline.yview)
-        self.timeline.configure(xscrollcommand=xbar.set, yscrollcommand=ybar.set)
+        def scrolled(first, last):
+            xbar.set(first, last)
+            self.timeline.draw_ticks()
+        self.timeline.configure(xscrollcommand=scrolled, yscrollcommand=ybar.set)
         self.timeline.grid(row=0, column=0, sticky="nsew")
         ybar.grid(row=0, column=1, sticky="ns")
         xbar.grid(row=1, column=0, sticky="ew")
         holder.columnconfigure(0, weight=1)
         holder.rowconfigure(0, weight=1)
 
-        arrange = ttk.Frame(self)
-        arrange.pack(fill="x", pady=(12, 8))
+        arrange = ttk.Frame(panel)
+        arrange.grid(row=3, column=0, sticky="ew", pady=(12, 8))
         ttk.Label(arrange, text="クリップ間の無音（秒）").pack(side="left")
         ttk.Entry(arrange, textvariable=self.gap_var, width=8).pack(side="left", padx=7)
         ttk.Button(arrange, text="全て順番に並べる", command=self.arrange_sequential).pack(side="left", padx=(4, 8))
         ttk.Button(arrange, text="全て先頭で重ねる", command=self.arrange_overlay).pack(side="left")
 
-        selected = ttk.LabelFrame(self, text="選択中のクリップ", padding=9)
-        selected.pack(fill="x")
+        selected = ttk.LabelFrame(panel, text="選択中のクリップ", padding=9)
+        selected.grid(row=4, column=0, sticky="ew")
         self.selected_label = ttk.Label(selected, text="未選択", foreground=MUTED)
         self.selected_label.pack(side="left", fill="x", expand=True)
         ttk.Label(selected, text="開始（秒）").pack(side="left")
@@ -694,14 +1064,16 @@ class MixTab(ttk.Frame):
         ttk.Button(selected, text="反映", command=self.apply_selected_values).pack(side="left")
         ttk.Button(selected, text="詳細設定", command=self.open_clip_details).pack(side="left", padx=(8, 0))
 
-        actions = ttk.Frame(self)
-        actions.pack(fill="x", pady=(12, 0))
+        self.seek = self.timeline.seek
+        self.timeline.bind("<<TimelineRedrawn>>", self._sync_seek_bounds)
+        bar = ExportActions(panel, "合成音声を書き出す", self.export)
+        bar.grid(row=6, column=0, sticky="ew", pady=(4, 0))
+        actions, self.export_quality = bar.transport, bar.quality
         ttk.Button(actions, text="▶ 全体を試聴", command=self.preview).pack(side="left")
+        ttk.Button(actions, text="↻ ループ再生", command=lambda: self.preview(True)).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="一時停止", command=lambda: self.app.pause_preview(self.seek)).pack(side="left", padx=(4, 0))
         ttk.Button(actions, text="■ 停止", command=self.stop_preview).pack(side="left", padx=8)
-        ttk.Label(actions, text="出力形式").pack(side="right", padx=(12, 6))
-        ttk.Combobox(actions, textvariable=self.format_var, values=("wav", "mp3", "m4a"), state="readonly", width=7).pack(side="right")
-        ttk.Button(actions, text="合成音声を書き出す", command=self.export, style="Accent.TButton").pack(side="right", padx=8)
-        ttk.Label(self, textvariable=self.status, foreground=MUTED).pack(anchor="w", pady=(10, 0))
+        ttk.Label(panel, textvariable=self.status, foreground=MUTED).grid(row=7, column=0, sticky="w", pady=(10, 0))
 
     def add_files(self) -> None:
         paths = filedialog.askopenfilenames(
@@ -794,22 +1166,30 @@ class MixTab(ttk.Frame):
         self.start_var.set(f"{clip.start:.3f}")
         self.lane_var.set(str(clip.lane + 1))
 
-    def clip_moved(self, clip: AudioClip) -> None:
+    def clip_moved(self, clip: AudioClip, requested: float, lane: int, snap: float = 0.0) -> None:
+        start = free_clip_start(self.clips, clip, lane, requested, snap)
+        if start is not None:
+            clip.start, clip.lane = start, lane
         if self.selected and self.selected.id == clip.id:
             self.start_var.set(f"{clip.start:.3f}")
             self.lane_var.set(str(clip.lane + 1))
-        self.status.set(f"全体 {format_time(self.total_duration())}")
+        self.status.set(f"全体 {format_time(self.total_duration())}" if start is not None
+                        else "このレーンにはクリップを置ける空きがありません")
 
     def apply_selected_values(self) -> None:
         if not self.selected:
             return
         try:
-            self.selected.start = max(0.0, float(self.start_var.get()))
-            self.selected.lane = max(0, min(15, int(self.lane_var.get()) - 1))
+            start = float(self.start_var.get())
+            if not math.isfinite(start):
+                raise ValueError
+            if self.start_var.get() == f"{self.selected.start:.3f}":
+                start = self.selected.start
+            lane = max(0, min(15, int(self.lane_var.get()) - 1))
         except ValueError:
             messagebox.showwarning(APP_NAME, "開始秒とレーンを正しく入力してください。")
             return
-        self.select_clip(self.selected)
+        self.clip_moved(self.selected, start, lane)
         self.timeline.redraw()
 
     def open_clip_details(self) -> None:
@@ -991,65 +1371,71 @@ class MixTab(ttk.Frame):
     def total_duration(self) -> float:
         return max([c.start + c.duration for c in self.clips] + [self.project_duration or 0.0])
 
-    def _render_mix(self, out: str) -> None:
+    def _sync_seek_bounds(self, _event):
+        end = self.total_duration() if self.clips else 0.0
+        if self.seek.end != end and self.app.active_bar is self.seek:
+            self.app.stop_playback()
+        self.seek.bounds(0, end)
+
+    def _render_mix(self, out: str, quality: str = "standard") -> None:
         project = audio.AudioProject(
             audio.PROJECT_VERSION, self.sample_rate, self.channels, self.clips,
             self.total_duration(), self.loudness_lufs, self.true_peak_db, self.project_path,
         )
-        command, _filters, _duration = audio.build_mix_command(project, out, overwrite=True)
+        command, _filters, _duration = audio.build_mix_command(project, out, overwrite=True, quality=quality)
         audio.run_command(command)
 
-    def preview(self) -> None:
+    def preview(self, loop=False) -> None:
         if not self.clips:
             messagebox.showinfo(APP_NAME, "先に音声ファイルを追加してください。")
             return
-        self.preview_serial += 1
-        serial = self.preview_serial
         duration = self.total_duration()
         out = str(TEMP_DIR / f"mix_preview_{uuid.uuid4().hex}.wav")
+        restart = self.seek.looping
         self.app.stop_playback()
+        self.app.active_bar = self.seek
+        self.seek.bounds(0, duration)
+        if restart or self.seek.position >= duration:
+            self.seek.show(0)
+        self.seek.looping = loop
+        request = self.app.playback_serial
         self.status.set("試聴用の音声を作成しています…")
 
         def work():
             self._render_mix(out)
-            return serial, out, duration
+            return request, out, loop
 
         def failed(exc: Exception) -> None:
             Path(out).unlink(missing_ok=True)
-            if serial == self.preview_serial:
+            if request == self.app.playback_serial:
+                self.app.stop_playback()
                 self._export_failed(exc)
 
         self.app.jobs.submit(work, self._preview_ready, failed)
 
     def stop_preview(self) -> None:
-        self.preview_serial += 1
         self.app.stop_playback()
+        self.seek.show(0.0)
         self.status.set("試聴を停止しました")
 
     def _preview_ready(self, result) -> None:
-        serial, path, duration = result
-        if serial != self.preview_serial:
+        request, path, loop = result
+        if request != self.app.playback_serial:
             Path(path).unlink(missing_ok=True)
             return
 
-        def update_playhead(position: float | None) -> None:
-            self.timeline.set_playhead(position)
-            if position is None and serial == self.preview_serial:
-                self.status.set("合成結果の試聴が終わりました")
-
-        self.status.set("合成結果を再生しています")
-        self.app.play(path, duration=duration, progress_callback=update_playhead, cleanup_path=path)
+        self.app.play(path, self.seek, loop)
 
     def export(self) -> None:
         if not self.clips:
             messagebox.showinfo(APP_NAME, "先に音声ファイルを追加してください。")
             return
-        fmt = self.format_var.get()
-        out = filedialog.asksaveasfilename(title="合成音声を書き出す", defaultextension=f".{fmt}", initialfile=f"mix.{fmt}", filetypes=[(fmt.upper(), f"*.{fmt}")])
+        out = choose_audio_output(self, "合成音声を書き出す", "mix", self.last_export_type)
         if not out:
             return
+        quality = QUALITY_PRESETS[self.export_quality.get()]
         self.status.set("合成音声を書き出しています…")
-        self.app.jobs.submit(lambda: (self._render_mix(out), out)[1], self._exported, lambda e: self._export_failed(e))
+        self.app.jobs.submit(lambda: (self._render_mix(out, quality), out)[1], self._exported, self._export_failed)
 
     def _exported(self, path: str) -> None:
         self.status.set(f"保存しました: {path}")
@@ -1077,10 +1463,9 @@ class AudioAtelierApp:
                 pass
         self.player: subprocess.Popen | None = None
         self.playback_serial = 0
-        self.progress_callback = None
+        self.active_bar = None
         self.play_started_at = 0.0
         self.play_origin = 0.0
-        self.play_duration: float | None = None
         self.play_cleanup_path: str | None = None
         self.jobs = BackgroundJobs(self.root)
         self._style()
@@ -1162,58 +1547,80 @@ class AudioAtelierApp:
     def _drop_event(self, event) -> None:
         self._files_dropped(self.root.tk.splitlist(event.data))
 
-    def play(
-        self,
-        path: str,
-        start: float | None = None,
-        duration: float | None = None,
-        progress_callback=None,
-        cleanup_path: str | None = None,
-    ) -> None:
-        self.stop_playback()
-        args = [FFPLAY, "-hide_banner", "-loglevel", "error", "-nodisp", "-autoexit"]
-        if start is not None:
-            args += ["-ss", f"{start:.6f}"]
-        if duration is not None:
-            args += ["-t", f"{max(0.01, duration):.6f}"]
-        args.append(path)
-        try:
-            self.player = subprocess.Popen(args, creationflags=creation_flags())
-            self.playback_serial += 1
-            serial = self.playback_serial
-            self.progress_callback = progress_callback
-            self.play_started_at = time.monotonic()
-            self.play_origin = start or 0.0
-            self.play_duration = duration
-            self.play_cleanup_path = cleanup_path
-            if self.progress_callback:
-                self.progress_callback(self.play_origin)
-            self.root.after(40, lambda: self._update_playback(serial))
-        except OSError as exc:
-            self._cleanup_playback_file(cleanup_path)
-            messagebox.showerror(APP_NAME, f"再生を開始できませんでした。\n{exc}")
+    def play(self, path, bar, loop):
+        self.play_cleanup_path = path
+        self.active_bar = bar
+        bar.looping = loop
+        if bar.position >= bar.end:
+            if not loop:
+                self.stop_playback()
+                return
+            bar.show(bar.start)
+        bar.tab.status.set("ループ再生中" if loop else "試聴中")
+        self._start_player(bar.position - bar.start)
 
-    def _update_playback(self, serial: int) -> None:
-        if serial != self.playback_serial or not self.player:
+    def _start_player(self, offset):
+        args = [FFPLAY, "-hide_banner", "-loglevel", "error", "-nodisp", "-autoexit"]
+        path = Path(self.play_cleanup_path)
+        if self.active_bar.looping:
+            # Feed each cycle into the same audio device without an EOF/relaunch gap.
+            args += ["-f", "lavfi", "-i", loop_preview_graph(path, offset)]
+        else:
+            if offset > 0:
+                args += ["-ss", f"{offset:.6f}"]
+            args.append(str(path))
+        self.playback_serial += 1
+        try:
+            self.player = subprocess.Popen(args, cwd=path.parent, creationflags=creation_flags())
+        except OSError as exc:
+            self.stop_playback()
+            messagebox.showerror(APP_NAME, f"再生を開始できませんでした。\n{exc}")
             return
-        if self.player.poll() is not None:
-            callback = self.progress_callback
-            self.player = None
-            self.progress_callback = None
-            cleanup_path = self.play_cleanup_path
-            self.play_cleanup_path = None
-            if callback:
-                callback(None)
-            self._cleanup_playback_file(cleanup_path)
-            return
-        elapsed = time.monotonic() - self.play_started_at
-        if self.play_duration is not None:
-            elapsed = min(elapsed, self.play_duration)
-        if self.progress_callback:
-            self.progress_callback(self.play_origin + elapsed)
+        self.play_origin = offset
+        self.play_started_at = time.monotonic()
+        serial = self.playback_serial
         self.root.after(40, lambda: self._update_playback(serial))
 
-    def stop_playback(self) -> None:
+    def seek(self, bar):
+        if self.active_bar is not bar or self.player is None:
+            return
+        self._stop_player()
+        if bar.position >= bar.end:
+            if not bar.looping:
+                self.stop_playback()
+                return
+            bar.show(bar.start)
+        self._start_player(bar.position - bar.start)
+
+    def _update_playback(self, serial):
+        if serial != self.playback_serial or self.player is None:
+            return
+        bar = self.active_bar
+        result = self.player.poll()
+        if result is not None and not bar.dragging:
+            self.stop_playback()
+            bar.show(bar.start)
+            bar.tab.status.set("試聴終了" if result == 0 else "試聴に失敗しました")
+            return
+        if not bar.dragging:
+            bar.show(self._play_position(bar))
+        self.root.after(40, lambda: self._update_playback(serial))
+
+    def _play_position(self, bar):
+        elapsed = self.play_origin + time.monotonic() - self.play_started_at
+        if bar.looping and bar.end > bar.start:
+            elapsed %= bar.end - bar.start
+        return bar.start + elapsed
+
+    def pause_preview(self, bar):
+        if self.active_bar is not bar:
+            return
+        position = self._play_position(bar) if self.player and not bar.dragging else bar.position
+        self.stop_playback()
+        bar.show(position)
+        bar.tab.status.set(f"一時停止　{format_time(bar.position)}")
+
+    def _stop_player(self):
         self.playback_serial += 1
         player = self.player
         if player and player.poll() is None:
@@ -1229,13 +1636,16 @@ class AudioAtelierApp:
             except OSError:
                 pass
         self.player = None
-        callback = self.progress_callback
-        self.progress_callback = None
-        cleanup_path = self.play_cleanup_path
+
+    def stop_playback(self) -> None:
+        self._stop_player()
+        if self.active_bar:
+            self.active_bar.tab.status.set("試聴を停止しました")
+        self.active_bar = None
+        for tab in (self.trim_tab, self.mix_tab):
+            tab.seek.looping = False
+        self._cleanup_playback_file(self.play_cleanup_path)
         self.play_cleanup_path = None
-        if callback:
-            callback(None)
-        self._cleanup_playback_file(cleanup_path)
 
     def _cleanup_playback_file(self, path: str | None, retries: int = 5) -> None:
         if not path:
@@ -1347,25 +1757,7 @@ def cli_main(argv: list[str]) -> int:
         return 1
 
 
-def _hide_own_console_when_launched_from_explorer() -> None:
-    if os.name != "nt" or not getattr(sys, "frozen", False):
-        return
-    try:
-        process_ids = (ctypes.c_uint32 * 8)()
-        count = ctypes.windll.kernel32.GetConsoleProcessList(process_ids, len(process_ids))
-        # PyInstallerのonefile版は、通常起動でも親と子の2プロセスが
-        # 同じコンソールへ接続する。シェルから起動した場合はPowerShellや
-        # cmdも加わって3以上になるため、2以下のときだけ自前の画面を隠す。
-        if count <= 2:
-            window = ctypes.windll.kernel32.GetConsoleWindow()
-            if window:
-                ctypes.windll.user32.ShowWindow(window, 0)
-    except Exception:
-        pass
-
-
 if __name__ == "__main__":
     if len(sys.argv) > 1:
         raise SystemExit(cli_main(sys.argv[1:]))
-    _hide_own_console_when_launched_from_explorer()
     AudioAtelierApp().run()
